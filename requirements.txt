@@ -1,0 +1,4 @@
+flask
+requests
+gunicorn
+line-bot-sdk
