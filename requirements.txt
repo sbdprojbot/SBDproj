@@ -1,4 +1,4 @@
 flask
 requests
 gunicorn
-line-bot-sdk
+line-bot-sdk==2.4.2
