@@ -1,54 +1,47 @@
-from flask import Flask, request
+from flask import Flask, request, abort
+import requests
 import os
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
-from linebot.exceptions import InvalidSignatureError
 
 app = Flask(__name__)
 
-# 讀取環境變數
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-
-if not LINE_CHANNEL_ACCESS_TOKEN:
-    raise ValueError("LINE_CHANNEL_ACCESS_TOKEN 未設定")
-
-if not LINE_CHANNEL_SECRET:
-    raise ValueError("LINE_CHANNEL_SECRET 未設定")
-
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-
-@app.route("/")
-def home():
-    return "sbdproj bot is running"
-
+CHANNEL_ACCESS_TOKEN = os.environ.get("CHANNEL_ACCESS_TOKEN")
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers.get('X-Line-Signature')
-    body = request.get_data(as_text=True)
+    body = request.json
 
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        return 'Invalid signature', 400
+    # 取得 replyToken & 使用者訊息
+    events = body.get("events", [])
+    for event in events:
+        if event["type"] == "message":
+            reply_token = event["replyToken"]
+            user_msg = event["message"]["text"]
 
-    return 'OK'
+            reply_message(reply_token, f"你說的是：{user_msg}")
+
+    return "OK"
 
 
-@handler.add(MessageEvent, message=TextMessage)
-def handle_text_message(event):
-    user_text = event.message.text
+def reply_message(reply_token, text):
+    url = "https://api.line.me/v2/bot/message/reply"
 
-    reply_text = f"你剛剛說的是：{user_text}"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+    }
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_text)
-    )
+    data = {
+        "replyToken": reply_token,
+        "messages": [
+            {
+                "type": "text",
+                "text": text
+            }
+        ]
+    }
+
+    requests.post(url, headers=headers, json=data)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run()
