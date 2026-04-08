@@ -1,4 +1,4 @@
-from flask import Flask, request, abort
+from flask import Flask, request
 import requests
 import os
 
@@ -6,14 +6,17 @@ app = Flask(__name__)
 
 CHANNEL_ACCESS_TOKEN = os.environ.get("CHANNEL_ACCESS_TOKEN")
 
+@app.route("/")
+def home():
+    return "bot is running"
+
 @app.route("/callback", methods=['POST'])
 def callback():
     body = request.json
 
-    # 取得 replyToken & 使用者訊息
     events = body.get("events", [])
     for event in events:
-        if event["type"] == "message":
+        if event.get("type") == "message" and event["message"].get("type") == "text":
             reply_token = event["replyToken"]
             user_msg = event["message"]["text"]
 
@@ -44,4 +47,4 @@ def reply_message(reply_token, text):
 
 
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
