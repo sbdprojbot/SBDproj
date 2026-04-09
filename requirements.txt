@@ -1,5 +1,4 @@
 flask
 gunicorn
-line-bot-sdk>=3.0.0
-requests
-openai
+requests==2.33.1
+transformers>=4.40.0
