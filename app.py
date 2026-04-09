@@ -26,6 +26,8 @@ def callback():
 
 
 def reply_message(reply_token, text):
+    print("TOKEN:", CHANNEL_ACCESS_TOKEN)
+
     url = "https://api.line.me/v2/bot/message/reply"
 
     headers = {
