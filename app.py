@@ -1,6 +1,7 @@
 from flask import Flask, request, abort
 import os
 import requests
+import json
 from transformers import pipeline
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
@@ -9,14 +10,13 @@ from linebot.exceptions import InvalidSignatureError
 app = Flask(__name__)
 
 # -----------------------------
-# 環境變數（Render 設定）
+# 環境變數
 # -----------------------------
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN")
 APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL")
 
-# 環境變數檢查
 for var_name, var_value in [
     ("LINE_CHANNEL_ACCESS_TOKEN", LINE_CHANNEL_ACCESS_TOKEN),
     ("LINE_CHANNEL_SECRET", LINE_CHANNEL_SECRET),
@@ -35,7 +35,6 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 # -----------------------------
 # HuggingFace NLP Pipeline
 # -----------------------------
-# 將自然語言轉 JSON
 nlp = pipeline(
     "text2text-generation",
     model="google/flan-t5-base",
@@ -63,7 +62,7 @@ def callback():
 def handle_text_message(event):
     user_text = event.message.text
 
-    # 1️⃣ NLP 解析使用者指令
+    # NLP 解析使用者指令
     prompt = f"""
     將使用者指令轉成 JSON：
     使用者指令: "{user_text}"
@@ -75,7 +74,7 @@ def handle_text_message(event):
     """
     try:
         result = nlp(prompt, max_length=512)[0]["generated_text"]
-        data = eval(result)  # 可改成 json.loads(result) 更安全
+        data = json.loads(result)
     except Exception as e:
         line_bot_api.reply_message(
             event.reply_token,
@@ -83,7 +82,7 @@ def handle_text_message(event):
         )
         return
 
-    # 2️⃣ 傳送 JSON 到 Apps Script
+    # 傳送到 Apps Script
     try:
         res = requests.post(APPS_SCRIPT_URL, json=data)
         result = res.json()
@@ -94,7 +93,7 @@ def handle_text_message(event):
     except Exception as e:
         reply_text = f"連線失敗：{e}"
 
-    # 3️⃣ 回覆 LINE 使用者
+    # 回覆 LINE 使用者
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=reply_text)
