@@ -1,7 +1,7 @@
 from flask import Flask, request, abort
 import os
 import requests
-import openai
+from openai import OpenAI
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from linebot.exceptions import InvalidSignatureError
@@ -26,9 +26,10 @@ for var_name, var_value in [
     if not var_value:
         raise ValueError(f"{var_name} 未設定！請先在 Render 環境變數設定。")
 
+# LINE & OpenAI 初始化
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-openai.api_key = OPENAI_API_KEY
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -----------------------------
 # Webhook 接收 LINE 訊息
@@ -50,24 +51,24 @@ def callback():
 def handle_text_message(event):
     user_text = event.message.text
 
-    # 1️⃣ 呼叫 GPT 解析自然語言 → JSON
+    # 1️⃣ GPT 自然語言解析 → JSON
     prompt = f"""
-    將以下使用者指令轉成 JSON：
+    將使用者指令轉成 JSON：
     使用者指令: "{user_text}"
 
     規則：
-    - 出貨：type = "shipment"，包含 name, product, quantity, note
-    - 會員：type = "member"，包含 name, phone, birthday, note
-    - 輸出 JSON 僅包含必要欄位
+    - 出貨：type="shipment"，包含 name, product, quantity, note
+    - 會員：type="member"，包含 name, phone, birthday, note
+    - JSON 僅保留必要欄位
     """
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4-turbo",
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
         json_str = response.choices[0].message.content.strip()
-        data = eval(json_str)  # 可再加檢查安全性
+        data = eval(json_str)  # 可加安全檢查
     except Exception as e:
         line_bot_api.reply_message(
             event.reply_token,
