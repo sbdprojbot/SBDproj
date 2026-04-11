@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 import os, json, re, threading, time, uuid
 from datetime import datetime
-from queue import Queue
+from queue import Queue, Empty
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -31,6 +31,9 @@ line_bot_api = LineBotApi(LINE_TOKEN)
 # =========================
 task_queue = Queue()
 trace_store = {}
+
+worker_alive = True
+last_heartbeat = time.time()
 
 ai_calls = 0
 ai_cache = {}
@@ -63,38 +66,32 @@ order_ws = ws("order", ["trace_id","order_id","time","user_id","name","product",
 log_ws = ws("log", ["time","trace_id","stage","type","message"])
 
 # =========================
-# TRACE LOG
+# SAFE LOG
 # =========================
 def log(trace_id, stage, type_, msg):
-    entry = {
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "trace_id": trace_id,
-        "stage": stage,
-        "type": type_,
-        "msg": str(msg)[:500]
-    }
+    row = [
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        trace_id,
+        stage,
+        type_,
+        str(msg)[:500]
+    ]
 
-    trace_store.setdefault(trace_id, []).append(entry)
+    print("LOG:", row)
 
     try:
-        log_ws.append_row([
-            entry["time"],
-            trace_id,
-            stage,
-            type_,
-            entry["msg"]
-        ])
-    except:
-        print("LOG FAIL", entry)
+        log_ws.append_row(row)
+    except Exception as e:
+        print("🔥 LOG WRITE FAIL:", e)
 
 # =========================
-# REPLY
+# LINE REPLY
 # =========================
 def reply(token, msg):
     try:
         line_bot_api.reply_message(token, TextSendMessage(text=msg))
     except Exception as e:
-        print("REPLY FAIL", e)
+        print("LINE REPLY FAIL:", e)
 
 # =========================
 # PARSER
@@ -110,9 +107,9 @@ def parse(text):
                     "qty": int(m.group(3))
                 }]
             }
-        return None
     except:
-        return None
+        pass
+    return None
 
 # =========================
 # AI PARSER
@@ -144,47 +141,56 @@ def ai_parse(text):
         ai_cache[text] = data
         return data
 
-    except:
+    except Exception as e:
+        print("AI FAIL:", e)
         return None
 
 # =========================
-# WRITE ORDER
+# WRITE ORDER (HARDENED)
 # =========================
 def write_order(trace_id, data, user_id):
-    try:
-        oid = "D" + datetime.now().strftime("%Y%m%d%H%M%S")
+    oid = "D" + datetime.now().strftime("%Y%m%d%H%M%S")
 
-        log(trace_id, "SHEET", "WRITE_START", oid)
+    for i in range(3):  # retry 3 times
+        try:
+            for item in data["items"]:
+                row = [
+                    trace_id,
+                    oid,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    user_id,
+                    data.get("name",""),
+                    item["product"],
+                    item["qty"],
+                    "confirmed"
+                ]
+                order_ws.append_row(row)
 
-        for item in data["items"]:
-            row = [
-                trace_id,
-                oid,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                user_id,
-                data.get("name",""),
-                item["product"],
-                item["qty"],
-                "confirmed"
-            ]
+            log(trace_id, "SHEET", "WRITE_OK", oid)
+            return
 
-            order_ws.append_row(row)
+        except Exception as e:
+            print(f"WRITE RETRY {i}", e)
+            time.sleep(1)
 
-        log(trace_id, "SHEET", "WRITE_OK", oid)
-
-    except Exception as e:
-        log(trace_id, "SHEET", "WRITE_FAIL", e)
+    log(trace_id, "SHEET", "WRITE_FAIL", "RETRY_EXHAUSTED")
 
 # =========================
 # WORKER
 # =========================
 def worker():
+    global last_heartbeat
+
     print("🔥 WORKER STARTED")
 
     while True:
-        task = task_queue.get()
+        try:
+            task = task_queue.get(timeout=5)
+        except Empty:
+            last_heartbeat = time.time()
+            continue
 
-        trace_id = task["trace_id"]
+        trace_id = task.get("trace_id", "NO_TRACE")
 
         try:
             log(trace_id, "QUEUE", "RECEIVED", task)
@@ -192,14 +198,8 @@ def worker():
             text = task["text"]
             user_id = task["user_id"]
 
-            log(trace_id, "PARSER", "START", text)
-
             data = parse(text)
-
-            if data:
-                log(trace_id, "PARSER", "OK", data)
-            else:
-                log(trace_id, "PARSER", "FALLBACK_AI", text)
+            if not data:
                 data = ai_parse(text)
 
             if data:
@@ -208,20 +208,30 @@ def worker():
                 log(trace_id, "ERROR", "PARSE_EMPTY", text)
 
         except Exception as e:
-            log(trace_id, "WORKER", "CRASH", e)
+            log(trace_id, "WORKER", "CRASH", str(e))
 
         finally:
             task_queue.task_done()
+            last_heartbeat = time.time()
 
 # =========================
-# START WORKER
+# WATCHDOG
 # =========================
-def start_worker():
-    t = threading.Thread(target=worker)
-    t.daemon = False
-    t.start()
+def watchdog():
+    global worker_alive, last_heartbeat
 
-start_worker()
+    while True:
+        time.sleep(30)
+
+        if time.time() - last_heartbeat > 60:
+            print("🔥 WORKER STUCK DETECTED")
+            worker_alive = False
+
+# =========================
+# START SYSTEM
+# =========================
+threading.Thread(target=worker, daemon=True).start()
+threading.Thread(target=watchdog, daemon=True).start()
 
 # =========================
 # WEBHOOK
@@ -252,13 +262,6 @@ def callback():
     return "OK"
 
 # =========================
-# DEBUG VIEW
-# =========================
-@app.route("/debug/<trace_id>")
-def debug(trace_id):
-    return jsonify(trace_store.get(trace_id, []))
-
-# =========================
 # HEALTH
 # =========================
 @app.route("/health")
@@ -266,7 +269,8 @@ def health():
     return jsonify({
         "status": "ok",
         "queue": task_queue.qsize(),
-        "ai_calls": ai_calls
+        "ai_calls": ai_calls,
+        "worker_alive": worker_alive
     })
 
 # =========================
@@ -274,7 +278,7 @@ def health():
 # =========================
 @app.route("/")
 def home():
-    return "v17.6 debug console running"
+    return "v17.7 production hardened running"
 
 # =========================
 # RUN
