@@ -1,13 +1,12 @@
 from flask import Flask, request
 import os
 import json
-import requests
 from datetime import datetime
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
 import openai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from linebot import LineBotApi, WebhookHandler
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
@@ -17,7 +16,7 @@ app = Flask(__name__)
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 openai.api_key = OPENAI_API_KEY
 
@@ -34,8 +33,9 @@ scope = [
 
 creds_dict = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+
 gs_client = gspread.authorize(creds)
-sheet = gs_client.open(SHEET_NAME)
+sheet = gs_client.open_by_key(SHEET_ID)
 
 # =====================
 # TIME
@@ -44,38 +44,23 @@ def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # =====================
-# SHEET LIVE READ
-# =====================
-def get_ws(name):
-    return sheet.worksheet(name)
-
-# =====================
-# HELP MENU（指令總表）
+# HELP MENU
 # =====================
 def help_menu():
-    return """📘 AI 訂單系統指令總表
+    return """📘 AI 訂單系統指令
 
 🧾 下單：
-👉 小明買牛奶2瓶
+小明買牛奶2瓶
 
 🔍 查詢：
-👉 小明今天買什麼
-👉 查詢 小明 本月
+查詢小明
+小明本月
 
 👤 會員：
-👉 新增會員 小明 0912...
+新增會員 小明 0912...
 
-📊 報表：
-👉 小明本月
-
-💬 可直接自然語言輸入 😊
+💬 輸入自然語言即可 😊
 """
-
-# =====================
-# 客服語氣
-# =====================
-def reply(text):
-    return f"👋 您好～\n\n{text}\n\n有需要可以再問我 😊"
 
 # =====================
 # INTENT
@@ -83,8 +68,6 @@ def reply(text):
 def intent(msg):
     if msg in ["指令", "help", "?", "？"]:
         return "help"
-    if "本月" in msg:
-        return "report"
     if "查" in msg:
         return "query"
     if "會員" in msg:
@@ -94,9 +77,9 @@ def intent(msg):
 # =====================
 # AI PARSER
 # =====================
-def parse_ai(text):
+def ai_parse(text):
     prompt = f"""
-將文字轉 JSON：
+轉 JSON：
 
 {text}
 
@@ -121,44 +104,28 @@ def parse_ai(text):
         return None
 
 # =====================
-# MEMBER UPSERT
+# QUERY SHEET
 # =====================
-def save_member(name, phone):
-    ws = get_ws("member")
+def query_order(name):
+    ws = sheet.worksheet("order")
     data = ws.get_all_values()
 
-    for i, row in enumerate(data[1:], start=2):
-        if row[0] == name:
-            ws.update(f"B{i}:D{i}", [
-                phone,
-                row[2],
-                now()
-            ])
-            return
-
-    ws.append_row([name, phone, now(), now()])
-
-# =====================
-# QUERY VIEW（客服查詢）
-# =====================
-def query_view(name):
-    ws = get_ws("order")
-    data = ws.get_all_values()
-
-    items = []
     total = 0
+    result = []
 
     for r in data[1:]:
+        if len(r) < 6:
+            continue
         if r[1] == name:
-            items.append(r)
+            result.append(r)
             total += float(r[5])
 
-    if not items:
-        return f"查無 {name} 的訂單"
+    if not result:
+        return f"查無 {name} 訂單"
 
-    text = f"📦 {name} 訂單明細\n\n"
+    text = f"📦 {name} 訂單\n\n"
 
-    for r in items:
+    for r in result:
         text += f"{r[2]} x{r[3]} = {r[5]}\n"
 
     text += f"\n💰 總計：{total}"
@@ -184,36 +151,32 @@ def callback():
 
             # HELP
             if mode == "help":
-                res = help_menu()
-
-            # REPORT
-            elif mode == "report":
-                res = reply("📊 正在查詢本月報表...（已啟用）")
+                reply = help_menu()
 
             # QUERY
             elif mode == "query":
-                name = msg.replace("查詢", "").strip() or "客戶"
-                res = reply(query_view(name))
+                name = msg.replace("查詢", "").strip()
+                reply = query_order(name or "客戶")
 
             # MEMBER
             elif mode == "member":
-                res = reply("👤 會員功能已處理")
+                reply = "👤 會員功能已啟用"
 
             # ORDER
             else:
-                data = parse_ai(msg)
+                data = ai_parse(msg)
 
                 if not data:
-                    res = "❌ 無法解析訂單，請重新輸入"
+                    reply = "❌ 無法解析訂單"
                 else:
-                    res = reply(f"已收到訂單：{data}")
+                    reply = f"已收到訂單：{data}"
 
         except Exception as ex:
-            res = f"⚠️ 系統錯誤：{ex}"
+            reply = f"⚠️ 錯誤：{ex}"
 
         line_bot_api.reply_message(
             e["replyToken"],
-            TextSendMessage(text=res)
+            TextSendMessage(text=reply)
         )
 
     return "OK"
