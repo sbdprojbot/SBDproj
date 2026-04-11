@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import os, json, re, uuid
+import os, json, re
 from datetime import datetime, date
 
 import gspread
@@ -23,27 +23,22 @@ line_bot_api = LineBotApi(LINE_TOKEN)
 openai.api_key = OPENAI_API_KEY
 
 # =========================
-# COST CONTROL (SAFE)
+# COST CONTROL
 # =========================
 cost_usage = {}
 DAILY_LIMIT = 0.03
-TEST_LIMIT = 0.07
-MODE = os.getenv("COST_MODE", "prod")
 
 def today():
     return str(date.today())
 
-def limit():
-    return TEST_LIMIT if MODE == "test" else DAILY_LIMIT
-
 def can_ai():
-    return cost_usage.get(today(), 0) < limit()
+    return cost_usage.get(today(), 0) < DAILY_LIMIT
 
 def add_cost(v=0.001):
     cost_usage[today()] = cost_usage.get(today(), 0) + v
 
 # =========================
-# SHEET INIT (SAFE)
+# SHEET INIT
 # =========================
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -67,30 +62,17 @@ def ws(name, cols):
     return w
 
 user_ws = ws("user", ["user_id","name","phone","address","time"])
-product_ws = ws("product", ["product","price","time"])
+product_ws = ws("product", ["product_id","product","price","time"])
 order_ws = ws("order", ["order_id","user","product","qty","time"])
-log_ws = ws("log", ["time","trace_id","stage","type","message"])
+log_ws = ws("log", ["time","stage","type","message"])
 
 # =========================
-# ID GENERATOR (SAFE + UNIQUE)
+# LOG
 # =========================
-def gen_user_id():
-    return "u" + str(uuid.uuid4().int)[:4]
-
-def gen_order_id():
-    return "d" + datetime.now().strftime("%f")[:6]
-
-def trace_id():
-    return "T" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:6]
-
-# =========================
-# SAFE LOG
-# =========================
-def log(tid, stage, type_, msg):
+def log(stage, type_, msg):
     try:
         log_ws.append_row([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            tid,
             stage,
             type_,
             str(msg)[:500]
@@ -99,11 +81,33 @@ def log(tid, stage, type_, msg):
         print("LOG FAIL:", msg)
 
 # =========================
-# RULE PARSER (FAST + FREE)
+# ID GENERATOR（6碼）
+# =========================
+def next_id(ws, prefix):
+    try:
+        records = ws.get_all_records()
+        num = len(records) + 1
+        return f"{prefix}{str(num).zfill(5)}"
+    except:
+        return f"{prefix}00001"
+
+# =========================
+# 防重
+# =========================
+processed = set()
+
+def is_duplicate(eid):
+    if eid in processed:
+        return True
+    processed.add(eid)
+    return False
+
+# =========================
+# RULE PARSER
 # =========================
 def rule_parse(text):
     try:
-        # order pattern
+        # 訂單
         m = re.search(r"(.*)買(.*?)(\d+)", text)
         if m:
             return {
@@ -113,13 +117,25 @@ def rule_parse(text):
                 "qty": int(m.group(3))
             }
 
-        # product quick
-        m2 = re.search(r"(.*) (\d+)元", text)
-        if m2:
+        # 產品
+        m = re.search(r"(.*)\s*(\d+)元", text)
+        if m:
             return {
                 "action":"create_product",
-                "product": m2.group(1).strip(),
-                "price": int(m2.group(2))
+                "product": m.group(1).strip(),
+                "price": int(m.group(2))
+            }
+
+        # 會員
+        if "電話" in text or "住" in text:
+            phone = re.search(r"09\d{8}", text)
+            addr = text.split("住")[-1] if "住" in text else ""
+
+            return {
+                "action":"create_user",
+                "name": text.split()[0],
+                "phone": phone.group() if phone else "",
+                "address": addr
             }
 
         return None
@@ -127,123 +143,96 @@ def rule_parse(text):
         return None
 
 # =========================
-# AI PARSER (SAFE + CONTROLLED)
+# AI PARSER（補強）
 # =========================
-def ai_parse(text, tid):
+def should_use_ai(text):
+    if len(text) < 6:
+        return True
+    if not any(k in text for k in ["買","元","電話","住"]):
+        return True
+    return False
+
+def ai_parse(text):
     if not can_ai():
-        log(tid,"AI","SKIP","limit reached")
         return None
 
     try:
-        prompt = f"""
-你是 NLP 系統，只輸出 JSON。
-
-action:
-- create_user
-- create_product
-- order
-
-格式：
-{{
- "action":"",
- "name":"",
- "phone":"",
- "address":"",
- "product":"",
- "price":0,
- "qty":0
-}}
-
-規則：
-- 沒有填 null
-- 不要解釋
-- 只 JSON
-
-輸入：
-{text}
-"""
-
         res = openai.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}],
+            messages=[{"role":"user","content":f"轉JSON：{text}"}],
             temperature=0
         )
-
         add_cost()
 
         content = res.choices[0].message.content
-
         match = re.search(r"\{.*\}", content, re.S)
-        if not match:
-            raise ValueError("NO JSON")
-
-        data = json.loads(match.group())
-
-        if "action" not in data:
-            raise ValueError("NO ACTION")
-
-        return data
-
-    except Exception as e:
-        log(tid,"AI","FAIL",str(e))
+        if match:
+            return json.loads(match.group())
+    except:
         return None
 
 # =========================
-# ROUTER (CORE LOGIC)
+# HANDLE
 # =========================
-def handle(data, tid):
+def handle(data):
+    try:
+        action = data.get("action")
 
-    action = data.get("action")
+        # USER
+        if action == "create_user":
+            if not data.get("name"):
+                return "⚠️ 缺少姓名"
 
-    # ================= USER =================
-    if action == "create_user":
-        uid = gen_user_id()
+            uid = next_id(user_ws, "u")
 
-        if not data.get("name"):
-            return "⚠️ 需要提供姓名"
+            user_ws.append_row([
+                uid,
+                data.get("name"),
+                data.get("phone",""),
+                data.get("address",""),
+                datetime.now().strftime("%H:%M")
+            ])
 
-        user_ws.append_row([
-            uid,
-            data.get("name"),
-            data.get("phone",""),
-            data.get("address",""),
-            datetime.now().strftime("%H:%M")
-        ])
+            return f"👤 會員建立成功：{uid}"
 
-        return f"👤 會員已建立：{uid}"
+        # PRODUCT
+        if action == "create_product":
+            if not data.get("product") or not data.get("price"):
+                return "⚠️ 需名稱+價格"
 
-    # ================= PRODUCT =================
-    if action == "create_product":
+            pid = next_id(product_ws, "p")
 
-        if not data.get("product") or not data.get("price"):
-            return "⚠️ 產品需包含：名稱 + 價格"
+            product_ws.append_row([
+                pid,
+                data.get("product"),
+                data.get("price"),
+                datetime.now().strftime("%H:%M")
+            ])
 
-        product_ws.append_row([
-            data.get("product"),
-            data.get("price"),
-            datetime.now().strftime("%H:%M")
-        ])
+            return f"📦 產品建立成功：{pid}"
 
-        return f"📦 產品已建立：{data.get('product')}"
+        # ORDER
+        if action == "order":
+            if not data.get("product"):
+                return "⚠️ 無商品"
 
-    # ================= ORDER =================
-    if action == "order":
-        oid = gen_order_id()
+            oid = next_id(order_ws, "d")
 
-        if not data.get("product"):
-            return "⚠️ 無商品資訊，無法建立訂單"
+            order_ws.append_row([
+                oid,
+                data.get("name","unknown"),
+                data.get("product"),
+                data.get("qty",1),
+                datetime.now().strftime("%H:%M")
+            ])
 
-        order_ws.append_row([
-            oid,
-            data.get("name","unknown"),
-            data.get("product"),
-            data.get("qty",1),
-            datetime.now().strftime("%H:%M")
-        ])
+            return f"🧾 訂單完成：{oid}"
 
-        return f"🧾 訂單完成：{oid}"
+        return "⚠️ 無法識別"
 
-    return "⚠️ 無法識別操作，請重新輸入"
+    except Exception as e:
+        log("HANDLE","FAIL",str(e))
+        return "❌ 寫入失敗"
 
 # =========================
 # WEBHOOK
@@ -258,39 +247,33 @@ def callback():
         if e["type"] != "message":
             continue
 
+        eid = e["message"]["id"]
+        if is_duplicate(eid):
+            return "OK"
+
         text = e["message"]["text"]
-        tid = trace_id()
 
-        log(tid,"WEBHOOK","RECEIVED",text)
+        log("WEBHOOK","RECEIVED",text)
 
-        # reply fast first (avoid LINE timeout)
+        data = rule_parse(text)
+
+        if not data or should_use_ai(text):
+            ai_data = ai_parse(text)
+            if ai_data:
+                data = ai_data
+
+        if data:
+            result = handle(data)
+        else:
+            result = "⚠️ 無法理解\n例：小明買牛奶2瓶"
+
         try:
             line_bot_api.reply_message(
                 e["replyToken"],
-                TextSendMessage(text="✅ 已收到，處理中")
-            )
-        except Exception as e:
-            log(tid,"LINE","FAIL",str(e))
-
-        # parse
-        data = rule_parse(text)
-
-        if not data:
-            data = ai_parse(text, tid)
-
-        if data:
-            result = handle(data, tid)
-        else:
-            result = "⚠️ 無法理解內容，請改成：\n例：小明買牛奶2瓶"
-
-        # optional follow-up (safe)
-        try:
-            line_bot_api.push_message(
-                e["source"]["userId"],
                 TextSendMessage(text=result)
             )
-        except Exception as e:
-            log(tid,"LINE_PUSH","FAIL",str(e))
+        except Exception as err:
+            log("LINE","FAIL",str(err))
 
     return "OK"
 
@@ -299,11 +282,10 @@ def callback():
 def health():
     return jsonify({
         "status":"ok",
-        "version":"v19.5",
-        "cost": cost_usage.get(today(),0),
-        "limit": limit()
+        "version":"v19.8",
+        "cost": cost_usage.get(today(),0)
     })
 
 @app.route("/")
 def home():
-    return "v19.5 hardened NLP system"
+    return "v19.8 stable"
