@@ -1,4 +1,6 @@
 flask
-gunicorn
 requests
-line-bot-sdk>=3.0.0
+line-bot-sdk
+openai
+gspread
+oauth2client
