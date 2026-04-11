@@ -63,7 +63,7 @@ def ws(name, cols):
 
 user_ws = ws("user", ["user_id","name","phone","address","time"])
 product_ws = ws("product", ["product_id","product","price","time"])
-order_ws = ws("order", ["order_id","user","product","qty","time"])
+order_ws = ws("order", ["order_id","user","product","qty","status","time"])
 log_ws = ws("log", ["time","stage","type","message"])
 
 # =========================
@@ -81,13 +81,12 @@ def log(stage, type_, msg):
         print("LOG FAIL:", msg)
 
 # =========================
-# ID GENERATOR（6碼）
+# ID（6碼）
 # =========================
 def next_id(ws, prefix):
     try:
         records = ws.get_all_records()
-        num = len(records) + 1
-        return f"{prefix}{str(num).zfill(5)}"
+        return f"{prefix}{str(len(records)+1).zfill(5)}"
     except:
         return f"{prefix}00001"
 
@@ -103,59 +102,93 @@ def is_duplicate(eid):
     return False
 
 # =========================
+# 查單
+# =========================
+def find_order(oid):
+    records = order_ws.get_all_records()
+    for idx, r in enumerate(records):
+        if r["order_id"] == oid:
+            return idx+2, r
+    return None, None
+
+# =========================
 # RULE PARSER
 # =========================
 def rule_parse(text):
-    try:
-        # 訂單
-        m = re.search(r"(.*)買(.*?)(\d+)", text)
+
+    # 查單
+    m = re.search(r"(查|看).*(d\d{5})", text)
+    if m:
+        return {"action":"query_order","order_id":m.group(2)}
+
+    # 修改
+    if "改" in text:
+        m = re.search(r"(d\d{5}).*(\d+)", text)
         if m:
             return {
-                "action":"order",
-                "name": m.group(1).strip(),
-                "product": m.group(2).strip(),
-                "qty": int(m.group(3))
+                "action":"update_order",
+                "order_id": m.group(1),
+                "qty": int(m.group(2))
             }
 
-        # 產品
-        m = re.search(r"(.*)\s*(\d+)元", text)
+    # 刪除
+    if "刪" in text:
+        m = re.search(r"(d\d{5})", text)
         if m:
-            return {
-                "action":"create_product",
-                "product": m.group(1).strip(),
-                "price": int(m.group(2))
-            }
+            return {"action":"delete_order","order_id":m.group(1)}
 
-        # 會員
-        if "電話" in text or "住" in text:
-            phone = re.search(r"09\d{8}", text)
-            addr = text.split("住")[-1] if "住" in text else ""
+    # 確認
+    if "確認" in text:
+        m = re.search(r"(d\d{5})", text)
+        if m:
+            return {"action":"confirm_order","order_id":m.group(1)}
 
-            return {
-                "action":"create_user",
-                "name": text.split()[0],
-                "phone": phone.group() if phone else "",
-                "address": addr
-            }
+    # 訂單
+    m = re.search(r"(.*)買(.*?)(\d+)", text)
+    if m:
+        return {
+            "action":"order",
+            "name": m.group(1).strip(),
+            "product": m.group(2).strip(),
+            "qty": int(m.group(3))
+        }
 
-        return None
-    except:
-        return None
+    # 產品
+    m = re.search(r"(.*)\s*(\d+)元", text)
+    if m:
+        return {
+            "action":"create_product",
+            "product": m.group(1).strip(),
+            "price": int(m.group(2))
+        }
+
+    # 會員
+    if "電話" in text or "住" in text:
+        phone = re.search(r"09\d{8}", text)
+        addr = text.split("住")[-1] if "住" in text else ""
+
+        return {
+            "action":"create_user",
+            "name": text.split()[0],
+            "phone": phone.group() if phone else "",
+            "address": addr
+        }
+
+    return None
 
 # =========================
-# AI PARSER（補強）
+# AI PARSER
 # =========================
 def should_use_ai(text):
     if len(text) < 6:
         return True
-    if not any(k in text for k in ["買","元","電話","住"]):
+    if not any(k in text for k in ["買","元","電話","住","查","改","刪","確認"]):
         return True
     return False
 
 def ai_parse(text):
     if not can_ai():
         return None
-
     try:
         res = openai.chat.completions.create(
             model="gpt-4o-mini",
@@ -164,8 +197,7 @@ def ai_parse(text):
         )
         add_cost()
 
-        content = res.choices[0].message.content
-        match = re.search(r"\{.*\}", content, re.S)
+        match = re.search(r"\{.*\}", res.choices[0].message.content, re.S)
         if match:
             return json.loads(match.group())
     except:
@@ -175,16 +207,13 @@ def ai_parse(text):
 # HANDLE
 # =========================
 def handle(data):
-    try:
-        action = data.get("action")
 
+    action = data.get("action")
+
+    try:
         # USER
         if action == "create_user":
-            if not data.get("name"):
-                return "⚠️ 缺少姓名"
-
-            uid = next_id(user_ws, "u")
-
+            uid = next_id(user_ws,"u")
             user_ws.append_row([
                 uid,
                 data.get("name"),
@@ -192,53 +221,80 @@ def handle(data):
                 data.get("address",""),
                 datetime.now().strftime("%H:%M")
             ])
-
             return f"👤 會員建立成功：{uid}"
 
         # PRODUCT
         if action == "create_product":
-            if not data.get("product") or not data.get("price"):
-                return "⚠️ 需名稱+價格"
-
-            pid = next_id(product_ws, "p")
-
+            pid = next_id(product_ws,"p")
             product_ws.append_row([
                 pid,
                 data.get("product"),
                 data.get("price"),
                 datetime.now().strftime("%H:%M")
             ])
-
             return f"📦 產品建立成功：{pid}"
 
         # ORDER
         if action == "order":
-            if not data.get("product"):
-                return "⚠️ 無商品"
-
-            oid = next_id(order_ws, "d")
-
+            oid = next_id(order_ws,"d")
             order_ws.append_row([
                 oid,
-                data.get("name","unknown"),
+                data.get("name"),
                 data.get("product"),
                 data.get("qty",1),
+                "pending",
                 datetime.now().strftime("%H:%M")
             ])
-
             return f"🧾 訂單完成：{oid}"
+
+        # QUERY
+        if action == "query_order":
+            row, o = find_order(data.get("order_id"))
+            if not o:
+                return "❌ 找不到訂單"
+            return f"""📄 訂單
+編號:{o['order_id']}
+姓名:{o['user']}
+商品:{o['product']}
+數量:{o['qty']}
+狀態:{o['status']}"""
+
+        # UPDATE
+        if action == "update_order":
+            row, o = find_order(data.get("order_id"))
+            if not o:
+                return "❌ 找不到訂單"
+            order_ws.update_cell(row,4,data.get("qty"))
+            return f"✏️ 已更新 {o['order_id']} → {data.get('qty')}"
+
+        # DELETE
+        if action == "delete_order":
+            row, o = find_order(data.get("order_id"))
+            if not o:
+                return "❌ 找不到訂單"
+            order_ws.delete_rows(row)
+            return f"🗑️ 已刪除 {o['order_id']}"
+
+        # CONFIRM
+        if action == "confirm_order":
+            row, o = find_order(data.get("order_id"))
+            if not o:
+                return "❌ 找不到訂單"
+            order_ws.update_cell(row,5,"confirmed")
+            return f"✅ 已確認 {o['order_id']}"
 
         return "⚠️ 無法識別"
 
     except Exception as e:
         log("HANDLE","FAIL",str(e))
-        return "❌ 寫入失敗"
+        return "❌ 系統錯誤"
 
 # =========================
 # WEBHOOK
 # =========================
 @app.route("/callback", methods=["POST"])
 def callback():
+
     body = request.get_json()
     events = body.get("events", [])
 
@@ -252,7 +308,6 @@ def callback():
             return "OK"
 
         text = e["message"]["text"]
-
         log("WEBHOOK","RECEIVED",text)
 
         data = rule_parse(text)
@@ -262,10 +317,7 @@ def callback():
             if ai_data:
                 data = ai_data
 
-        if data:
-            result = handle(data)
-        else:
-            result = "⚠️ 無法理解\n例：小明買牛奶2瓶"
+        result = handle(data) if data else "⚠️ 無法理解"
 
         try:
             line_bot_api.reply_message(
@@ -282,10 +334,10 @@ def callback():
 def health():
     return jsonify({
         "status":"ok",
-        "version":"v19.8",
+        "version":"v20",
         "cost": cost_usage.get(today(),0)
     })
 
 @app.route("/")
 def home():
-    return "v19.8 stable"
+    return "v20 running"
