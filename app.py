@@ -1,6 +1,6 @@
-from flask import Flask, request
-import time
+from flask import Flask, request, abort
 import re
+import time
 from datetime import datetime
 
 app = Flask(__name__)
@@ -10,16 +10,6 @@ app = Flask(__name__)
 # =========================
 
 processed_events = set()
-
-# =========================
-# 🧠 SCHEMA ENGINE
-# =========================
-
-SCHEMA = {
-    "order": ["product", "qty"],
-    "product": ["product", "price"],
-    "user": ["name", "phone"]
-}
 
 # =========================
 # 🧠 UNIT ENGINE
@@ -48,6 +38,8 @@ UNIT_MAP = {
 NOISE = ["我要","幫我","請","來","買","給我"]
 
 def clean(text):
+    if not text:
+        return ""
     for w in NOISE:
         text = text.replace(w,"")
     return text.strip()
@@ -82,8 +74,10 @@ def unit_engine(text):
     for k in list(NUM_MAP.keys()) + list(UNIT_MAP.keys()):
         product = product.replace(k,"")
 
+    product = product.strip()
+
     return {
-        "product": product.strip(),
+        "product": product if product else "unknown",
         "qty": qty,
         "unit": unit
     }
@@ -94,7 +88,7 @@ def unit_engine(text):
 
 def is_duplicate(event_id):
     if not event_id:
-        return True
+        return False
     if event_id in processed_events:
         return True
     processed_events.add(event_id)
@@ -108,97 +102,92 @@ def now():
     return int(time.time()), datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # =========================
-# 🧠 VALIDATION
+# 🧠 LOG (SAFE)
 # =========================
 
-def validate(action, data):
-
-    required = SCHEMA.get(action, [])
-    missing = []
-
-    for f in required:
-        if f not in data or data[f] in ["", None, 0]:
-            missing.append(f)
-
-    return len(missing) == 0, missing
-
-# =========================
-# 🤖 AI LOG (SAFE ONLY)
-# =========================
-
-def ai_log(log):
-
-    if log["type"] == "MISSING":
-        return "缺少欄位：" + ",".join(log.get("missing_fields", []))
-
-    if log["type"] == "ERROR":
-        return "系統錯誤，需要檢查Sheet / API"
-
-    return "正常運行"
-
-# =========================
-# 📊 LOG BUILDER
-# =========================
-
-def build_log(event, parsed, log_type, missing=None):
-
-    ts, dt = now()
-
-    log = {
-        "log_id": event.get("id",""),
-        "timestamp": ts,
-        "display_time": dt,
-        "type": log_type,
-        "level": "INFO" if log_type=="ORDER" else "WARN",
-        "stage": "ENGINE",
-        "message": event.get("message",""),
-        "parsed": parsed,
-        "missing_fields": missing or [],
-        "ai_summary": "",
-        "ai_suggestion": ""
-    }
-
-    log["ai_summary"] = ai_log(log)
-    log["ai_suggestion"] = "check schema or sheet"
-
-    return log
+def log_event(data):
+    print("LOG:", data)
 
 # =========================
 # 🧠 CORE ENGINE
 # =========================
 
-def handle_event(event):
-
-    event_id = event.get("id","")
-    text = event.get("message","")
-
-    if is_duplicate(event_id):
-        return "duplicate ignored"
+def handle_text(text):
 
     parsed = unit_engine(text)
-
-    ok, missing = validate("order", parsed)
-
-    if not ok:
-        log = build_log(event, parsed, "MISSING", missing)
-        return "⚠️ 請補資料：" + ",".join(missing)
-
-    log = build_log(event, parsed, "ORDER")
 
     return f"✔ 訂單成立：{parsed['product']} x{parsed['qty']} ({parsed['unit']})"
 
 # =========================
-# 🌐 ROUTE
+# 📡 LINE CALLBACK
+# =========================
+
+@app.route("/callback", methods=["POST"])
+def callback():
+
+    try:
+        body = request.get_json()
+
+        print("RAW EVENT:", body)
+
+        if not body:
+            return "no body", 200
+
+        events = body.get("events", [])
+
+        if not events:
+            return "no events", 200
+
+        event = events[0]
+
+        event_id = event.get("webhookEventId") or event.get("replyToken")
+
+        if is_duplicate(event_id):
+            return "duplicate", 200
+
+        message = event.get("message", {})
+        text = message.get("text", "")
+
+        reply_token = event.get("replyToken")
+
+        result = handle_text(text)
+
+        log_event({
+            "event_id": event_id,
+            "text": text,
+            "result": result
+        })
+
+        # 👉 LINE reply (safe fallback: 不會 crash)
+        try:
+            from linebot import LineBotApi
+            from linebot.models import TextSendMessage
+
+            CHANNEL_ACCESS_TOKEN = "YOUR_TOKEN_HERE"
+
+            line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+
+            line_bot_api.reply_message(
+                reply_token,
+                TextSendMessage(text=result)
+            )
+
+        except Exception as e:
+            print("LINE REPLY ERROR:", e)
+
+        return "OK", 200
+
+    except Exception as e:
+        print("FATAL ERROR:", e)
+        return "error", 200
+
+# =========================
+# 🧪 HEALTH CHECK
 # =========================
 
 @app.route("/", methods=["GET"])
 def home():
-    return "LINE POS SYSTEM READY"
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json()
-    return handle_event(data)
+    return "LINE POS SYSTEM RUNNING", 200
 
 # =========================
 # 🚀 RUN
