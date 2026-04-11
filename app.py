@@ -1,6 +1,5 @@
 from flask import Flask, request
-import os
-import json
+import os, json
 from datetime import datetime
 
 import openai
@@ -8,35 +7,24 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import TextSendMessage
 
 # =========================
 # APP INIT
 # =========================
 app = Flask(__name__)
 
-# =========================
-# ENV
-# =========================
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 openai.api_key = OPENAI_API_KEY
-
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
 # =========================
-# HEALTH CHECK
-# =========================
-@app.route("/")
-def home():
-    return "OK"
-
-# =========================
-# GOOGLE SHEET AUTH
+# SHEET AUTH
 # =========================
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -50,17 +38,69 @@ gs_client = gspread.authorize(creds)
 sheet = gs_client.open_by_key(SHEET_ID)
 
 # =========================
+# SCHEMA (v9 防呆核心)
+# =========================
+SCHEMA = {
+    "order": ["order_id","time","user_id","name","product","qty","price","total","status"],
+    "member": ["user_id","name","phone","address","created_at","updated_at","note"],
+    "product": ["product_id","product","price","category","stock","status"],
+    "log": ["time","user_id","input","intent","status","error","ai_explain"]
+}
+
+# =========================
 # TIME
 # =========================
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # =========================
-# AI PARSER（多商品）
+# SHEET AUTO FIX (v9🔥)
+# =========================
+def ensure_sheet(name):
+    try:
+        return sheet.worksheet(name)
+    except:
+        return sheet.add_worksheet(title=name, rows="1000", cols="20")
+
+def fix_columns(ws, expected):
+    rows = ws.get_all_values()
+    if not rows:
+        ws.append_row(expected)
+        return
+
+    header = rows[0]
+    missing = [c for c in expected if c not in header]
+
+    if missing:
+        ws.update("A1", [header + missing])
+
+def init_sheets():
+    for name, cols in SCHEMA.items():
+        ws = ensure_sheet(name)
+        fix_columns(ws, cols)
+
+init_sheets()
+
+# =========================
+# PRICE FROM PRODUCT SHEET
+# =========================
+def get_price(product):
+    try:
+        ws = sheet.worksheet("product")
+        rows = ws.get_all_values()
+        for r in rows[1:]:
+            if r[1] == product:
+                return int(r[2])
+    except:
+        pass
+    return 0
+
+# =========================
+# AI PARSER
 # =========================
 def parse_order(text):
     prompt = f"""
-將使用者輸入轉 JSON（可多商品）：
+轉 JSON（可多商品）：
 
 {text}
 
@@ -71,14 +111,12 @@ def parse_order(text):
     {{"product": "", "qty": 1}}
   ]
 }}
-
 只輸出 JSON
 """
-
     try:
         res = openai.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role":"user","content":prompt}],
             temperature=0
         )
         return json.loads(res.choices[0].message.content)
@@ -86,139 +124,82 @@ def parse_order(text):
         return None
 
 # =========================
-# 價格表（可未來改 Sheet）
-# =========================
-PRICE_MAP = {
-    "牛奶": 30,
-    "麵包": 25,
-    "水": 20
-}
-
-# =========================
-# MEMBER（含地址）
+# MEMBER UPSERT
 # =========================
 def upsert_member(user_id, name, address=None):
-    try:
-        ws = sheet.worksheet("member")
-    except:
-        ws = sheet.add_worksheet("member", rows="1000", cols="10")
-        ws.append_row(["user_id", "name", "phone", "address", "created_at", "updated_at", "note"])
-
+    ws = sheet.worksheet("member")
     rows = ws.get_all_values()
 
-    for i, r in enumerate(rows):
-        if i == 0:
-            continue
-        if r[0] == user_id:
-            ws.update_cell(i+1, 2, name)
+    for i,r in enumerate(rows):
+        if i==0: continue
+        if r[0]==user_id:
+            ws.update_cell(i+1,2,name)
             if address:
-                ws.update_cell(i+1, 4, address)
-            ws.update_cell(i+1, 6, now())
+                ws.update_cell(i+1,4,address)
+            ws.update_cell(i+1,6,now())
             return
 
-    ws.append_row([user_id, name, "", address or "", now(), now(), ""])
+    ws.append_row([user_id,name,"",address or "",now(),now(),""])
 
 # =========================
-# ADDRESS DETECTION
-# =========================
-def detect_address(text):
-    if "地址" in text or "住在" in text or "住址" in text:
-        return text.split("是")[-1].strip()
-    return None
-
-# =========================
-# WRITE ORDER
+# ORDER WRITE
 # =========================
 def write_order(user_id, data):
-    try:
-        ws = sheet.worksheet("order")
-    except:
-        ws = sheet.add_worksheet("order", rows="2000", cols="10")
-        ws.append_row(["time", "user_id", "name", "product", "qty", "price", "total"])
+    ws = sheet.worksheet("order")
 
-    name = data.get("name", "未知")
-    items = data.get("items", [])
+    order_id = f"ORD{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    name = data.get("name","未知")
 
-    upsert_member(user_id, name)
+    total_all = 0
 
-    for item in items:
+    for item in data["items"]:
         product = item["product"]
-        qty = int(item["qty"])
-        price = PRICE_MAP.get(product, 0)
+        qty = int(item.get("qty",1))
+        price = get_price(product)
         total = price * qty
+        total_all += total
 
         ws.append_row([
+            order_id,
             now(),
             user_id,
             name,
             product,
             qty,
             price,
-            total
+            total,
+            "confirmed"
         ])
 
+    return order_id, total_all
+
 # =========================
-# QUERY ORDER
+# QUERY
 # =========================
 def query(name):
     ws = sheet.worksheet("order")
     rows = ws.get_all_values()
 
     text = f"📦 {name} 訂單\n\n"
-    total_sum = 0
+    total = 0
 
     for r in rows[1:]:
-        if len(r) < 7:
-            continue
-        if r[2] == name:
-            text += f"{r[3]} x{r[4]} = {r[6]}\n"
-            total_sum += int(r[6])
+        if len(r)<9: continue
+        if r[3]==name:
+            text += f"{r[4]} x{r[5]} = {r[7]}\n"
+            total += int(r[7])
 
-    text += f"\n💰 總金額：{total_sum}"
+    text += f"\n💰 總金額：{total}"
     return text
-
-# =========================
-# QUERY ADDRESS
-# =========================
-def query_address(user_id):
-    ws = sheet.worksheet("member")
-    rows = ws.get_all_values()
-
-    for r in rows[1:]:
-        if r[0] == user_id:
-            return f"🏠 你的地址：{r[3] or '未設定'}"
-
-    return "查無會員資料"
 
 # =========================
 # INTENT
 # =========================
 def intent(msg):
-    if msg in ["help", "指令"]:
-        return "help"
-    if "查詢" in msg:
-        return "query"
-    if "地址" in msg:
-        return "address"
+    if msg.startswith("修正"): return "fix"
+    if msg.startswith("刪除"): return "delete"
+    if "查詢" in msg: return "query"
     return "order"
-
-# =========================
-# HELP
-# =========================
-def help_text():
-    return """🧠 LINE 訂單系統 v3-lite
-
-🧾 下單：
-小明買牛奶2瓶麵包1個
-
-🔍 查詢：
-查詢小明
-
-🏠 地址：
-住址是台北板橋文化路
-
-📊 月報（未開放）
-"""
 
 # =========================
 # WEBHOOK
@@ -238,33 +219,24 @@ def callback():
         try:
             mode = intent(text)
 
-            # HELP
-            if mode == "help":
-                reply = help_text()
-
-            # ADDRESS QUERY
-            elif mode == "address":
-                addr = detect_address(text)
-                if addr:
-                    upsert_member(user_id, "未知", addr)
-                    reply = f"🏠 已更新地址：{addr}"
-                else:
-                    reply = query_address(user_id)
-
-            # ORDER QUERY
-            elif mode == "query":
-                name = text.replace("查詢", "").strip()
+            # QUERY
+            if mode == "query":
+                name = text.replace("查詢","").strip()
                 reply = query(name or "未知")
 
             # ORDER
-            else:
+            elif mode == "order":
                 data = parse_order(text)
 
                 if not data:
                     reply = "❌ 無法解析訂單"
                 else:
-                    write_order(user_id, data)
-                    reply = f"✅ 已記錄訂單"
+                    order_id, total = write_order(user_id,data)
+                    upsert_member(user_id,data.get("name","未知"))
+                    reply = f"✅ 已建立訂單\n{order_id}\n💰 {total}"
+
+            else:
+                reply = "⚠️ 功能尚未開放"
 
         except Exception as ex:
             reply = f"⚠️ 系統錯誤：{ex}"
