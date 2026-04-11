@@ -10,11 +10,11 @@ from linebot.models import TextSendMessage
 
 import openai
 
-# =========================
-# APP INIT
-# =========================
 app = Flask(__name__)
 
+# =========================
+# ENV
+# =========================
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
@@ -23,34 +23,27 @@ line_bot_api = LineBotApi(LINE_TOKEN)
 openai.api_key = OPENAI_API_KEY
 
 # =========================
-# COST CONTROL
+# COST CONTROL (SAFE)
 # =========================
+cost_usage = {}
 DAILY_LIMIT = 0.03
 TEST_LIMIT = 0.07
-COST_MODE = os.getenv("COST_MODE", "prod")
-
-cost_usage = {}
+MODE = os.getenv("COST_MODE", "prod")
 
 def today():
     return str(date.today())
 
 def limit():
-    return TEST_LIMIT if COST_MODE == "test" else DAILY_LIMIT
+    return TEST_LIMIT if MODE == "test" else DAILY_LIMIT
 
-def add_cost(v):
-    k = today()
-    cost_usage[k] = cost_usage.get(k, 0) + v
-
-def can_use_ai():
+def can_ai():
     return cost_usage.get(today(), 0) < limit()
 
-# =========================
-# CACHE (safe in-memory)
-# =========================
-ai_cache = {}
+def add_cost(v=0.001):
+    cost_usage[today()] = cost_usage.get(today(), 0) + v
 
 # =========================
-# SHEET INIT
+# SHEET INIT (SAFE)
 # =========================
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -73,84 +66,98 @@ def ws(name, cols):
         w.append_row(cols)
     return w
 
-order_ws = ws("order", ["trace_id","order_id","time","user_id","name","product","qty","status"])
-log_ws = ws("log", ["time","trace_id","stage","type","message","ai_analysis"])
+user_ws = ws("user", ["user_id","name","phone","address","time"])
+product_ws = ws("product", ["product","price","time"])
+order_ws = ws("order", ["order_id","user","product","qty","time"])
+log_ws = ws("log", ["time","trace_id","stage","type","message"])
 
 # =========================
-# LOG
+# ID GENERATOR (SAFE + UNIQUE)
 # =========================
-def log(trace_id, stage, type_, msg, ai_analysis=""):
-    row = [
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        trace_id,
-        stage,
-        type_,
-        str(msg)[:500],
-        ai_analysis
-    ]
-    print("LOG:", row)
+def gen_user_id():
+    return "u" + str(uuid.uuid4().int)[:4]
 
+def gen_order_id():
+    return "d" + datetime.now().strftime("%f")[:6]
+
+def trace_id():
+    return "T" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:6]
+
+# =========================
+# SAFE LOG
+# =========================
+def log(tid, stage, type_, msg):
     try:
-        log_ws.append_row(row)
+        log_ws.append_row([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            tid,
+            stage,
+            type_,
+            str(msg)[:500]
+        ])
     except:
-        pass
+        print("LOG FAIL:", msg)
 
 # =========================
-# LINE REPLY SAFE
-# =========================
-def reply(token, msg):
-    try:
-        line_bot_api.reply_message(token, TextSendMessage(text=msg))
-    except Exception as e:
-        print("LINE FAIL:", e)
-
-# =========================
-# RULE PARSER (FAST PATH)
+# RULE PARSER (FAST + FREE)
 # =========================
 def rule_parse(text):
     try:
+        # order pattern
         m = re.search(r"(.*)買(.*?)(\d+)", text)
-        if not m:
-            return None
-
-        return {
-            "name": m.group(1).strip(),
-            "items": [{
+        if m:
+            return {
+                "action":"order",
+                "name": m.group(1).strip(),
                 "product": m.group(2).strip(),
                 "qty": int(m.group(3))
-            }],
-            "source": "rule"
-        }
+            }
+
+        # product quick
+        m2 = re.search(r"(.*) (\d+)元", text)
+        if m2:
+            return {
+                "action":"create_product",
+                "product": m2.group(1).strip(),
+                "price": int(m2.group(2))
+            }
+
+        return None
     except:
         return None
 
 # =========================
-# AI PARSER (HARDENED)
+# AI PARSER (SAFE + CONTROLLED)
 # =========================
-def ai_parse(text):
-    if not can_use_ai():
+def ai_parse(text, tid):
+    if not can_ai():
+        log(tid,"AI","SKIP","limit reached")
         return None
-
-    # cache hit
-    if text in ai_cache:
-        return ai_cache[text]
 
     try:
         prompt = f"""
-你是訂單解析系統，只能輸出 JSON。
+你是 NLP 系統，只輸出 JSON。
+
+action:
+- create_user
+- create_product
+- order
 
 格式：
 {{
-  "name": "string",
-  "items": [
-    {{"product": "string", "qty": number}}
-  ]
+ "action":"",
+ "name":"",
+ "phone":"",
+ "address":"",
+ "product":"",
+ "price":0,
+ "qty":0
 }}
 
 規則：
-- 只能 JSON
-- 不要 markdown
+- 沒有填 null
 - 不要解釋
+- 只 JSON
 
 輸入：
 {text}
@@ -162,63 +169,81 @@ def ai_parse(text):
             temperature=0
         )
 
-        add_cost(0.001)
+        add_cost()
 
-        content = res.choices[0].message.content.strip()
+        content = res.choices[0].message.content
 
-        # safe json extract
         match = re.search(r"\{.*\}", content, re.S)
         if not match:
-            raise ValueError("No JSON found")
+            raise ValueError("NO JSON")
 
         data = json.loads(match.group())
 
-        # validation guard
-        if "items" not in data:
-            raise ValueError("Invalid schema")
+        if "action" not in data:
+            raise ValueError("NO ACTION")
 
-        data["source"] = "ai"
-
-        ai_cache[text] = data
         return data
 
     except Exception as e:
-        log("NO_TRACE", "AI", "FAIL", str(e))
+        log(tid,"AI","FAIL",str(e))
         return None
 
 # =========================
-# PARSER ENTRY
+# ROUTER (CORE LOGIC)
 # =========================
-def parse(text):
-    data = rule_parse(text)
-    if data:
-        return data
+def handle(data, tid):
 
-    return ai_parse(text)
+    action = data.get("action")
 
-# =========================
-# WRITE ORDER
-# =========================
-def write_order(trace_id, data, user_id):
-    order_id = "D" + datetime.now().strftime("%Y%m%d%H%M%S")
+    # ================= USER =================
+    if action == "create_user":
+        uid = gen_user_id()
 
-    try:
-        for item in data["items"]:
-            order_ws.append_row([
-                trace_id,
-                order_id,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                user_id,
-                data.get("name",""),
-                item.get("product",""),
-                item.get("qty",0),
-                "confirmed"
-            ])
+        if not data.get("name"):
+            return "⚠️ 需要提供姓名"
 
-        log(trace_id, "SHEET", "OK", order_id)
+        user_ws.append_row([
+            uid,
+            data.get("name"),
+            data.get("phone",""),
+            data.get("address",""),
+            datetime.now().strftime("%H:%M")
+        ])
 
-    except Exception as e:
-        log(trace_id, "SHEET", "FAIL", str(e))
+        return f"👤 會員已建立：{uid}"
+
+    # ================= PRODUCT =================
+    if action == "create_product":
+
+        if not data.get("product") or not data.get("price"):
+            return "⚠️ 產品需包含：名稱 + 價格"
+
+        product_ws.append_row([
+            data.get("product"),
+            data.get("price"),
+            datetime.now().strftime("%H:%M")
+        ])
+
+        return f"📦 產品已建立：{data.get('product')}"
+
+    # ================= ORDER =================
+    if action == "order":
+        oid = gen_order_id()
+
+        if not data.get("product"):
+            return "⚠️ 無商品資訊，無法建立訂單"
+
+        order_ws.append_row([
+            oid,
+            data.get("name","unknown"),
+            data.get("product"),
+            data.get("qty",1),
+            datetime.now().strftime("%H:%M")
+        ])
+
+        return f"🧾 訂單完成：{oid}"
+
+    return "⚠️ 無法識別操作，請重新輸入"
 
 # =========================
 # WEBHOOK
@@ -234,42 +259,51 @@ def callback():
             continue
 
         text = e["message"]["text"]
-        user_id = e["source"]["userId"]
+        tid = trace_id()
 
-        trace_id = "T" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:6]
+        log(tid,"WEBHOOK","RECEIVED",text)
 
-        log(trace_id, "WEBHOOK", "RECEIVED", text)
+        # reply fast first (avoid LINE timeout)
+        try:
+            line_bot_api.reply_message(
+                e["replyToken"],
+                TextSendMessage(text="✅ 已收到，處理中")
+            )
+        except Exception as e:
+            log(tid,"LINE","FAIL",str(e))
 
-        reply(e["replyToken"], "✅ 已收到，處理中")
+        # parse
+        data = rule_parse(text)
 
-        data = parse(text)
+        if not data:
+            data = ai_parse(text, tid)
 
         if data:
-            write_order(trace_id, data, user_id)
+            result = handle(data, tid)
         else:
-            log(trace_id, "ERROR", "PARSE_FAIL", text)
+            result = "⚠️ 無法理解內容，請改成：\n例：小明買牛奶2瓶"
+
+        # optional follow-up (safe)
+        try:
+            line_bot_api.push_message(
+                e["source"]["userId"],
+                TextSendMessage(text=result)
+            )
+        except Exception as e:
+            log(tid,"LINE_PUSH","FAIL",str(e))
 
     return "OK"
 
-# =========================
-# HEALTH
 # =========================
 @app.route("/health")
 def health():
     return jsonify({
         "status":"ok",
-        "version":"v18.4",
-        "cost_mode": COST_MODE,
-        "today_cost": cost_usage.get(today(),0),
-        "limit": limit(),
-        "cache_size": len(ai_cache)
+        "version":"v19.5",
+        "cost": cost_usage.get(today(),0),
+        "limit": limit()
     })
 
-# =========================
 @app.route("/")
 def home():
-    return "v18.4 engineered stable AI system"
-
-# =========================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT",10000)))
+    return "v19.5 hardened NLP system"
