@@ -1,208 +1,195 @@
+from flask import Flask, request
 import time
+import re
 from datetime import datetime
 
+app = Flask(__name__)
+
 # =========================
-# 🧠 GLOBAL SAFETY STATE
+# 🧠 STATE
 # =========================
 
 processed_events = set()
-MAX_RETRY = 3
 
-ALLOWED_ACTIONS = {
-    "create_order",
-    "create_user",
-    "create_product",
-    "query",
-    "update",
-    "delete"
+# =========================
+# 🧠 SCHEMA
+# =========================
+
+SCHEMA = {
+    "create_order": ["product", "qty"],
+    "create_product": ["product", "price"],
+    "create_user": ["name", "phone"]
 }
 
 # =========================
-# 🟢 DUPLICATE GUARD
+# 🧠 UNIT ENGINE
+# =========================
+
+NUM_MAP = {
+    "一":1,"壹":1,"1":1,
+    "兩":2,"二":2,"2":2,
+    "三":3,"3":3,
+    "四":4,"4":4,
+    "五":5,"5":5,
+    "六":6,"6":6,
+    "七":7,"7":7,
+    "八":8,"8":8,
+    "九":9,"9":9,
+    "十":10,"10":10
+}
+
+UNIT_MAP = {
+    "杯":"cup",
+    "瓶":"bottle",
+    "個":"piece",
+    "份":"set",
+    "碗":"bowl"
+}
+
+NOISE = ["我要","幫我","請","來","買","給我"]
+
+def clean(text):
+    for w in NOISE:
+        text = text.replace(w,"")
+    return text.strip()
+
+def parse_unit(text):
+
+    qty = 1
+    unit = "piece"
+
+    for k,v in NUM_MAP.items():
+        if k in text:
+            qty = v
+            break
+
+    for k,v in UNIT_MAP.items():
+        if k in text:
+            unit = v
+
+    m = re.search(r"\d+", text)
+    if m:
+        qty = int(m.group())
+
+    return qty, unit
+
+def unit_engine(text):
+
+    text = clean(text)
+
+    qty, unit = parse_unit(text)
+
+    product = text
+
+    for k in list(NUM_MAP.keys()) + list(UNIT_MAP.keys()):
+        product = product.replace(k,"")
+
+    return {
+        "product": product.strip(),
+        "qty": qty,
+        "unit": unit
+    }
+
+# =========================
+# 🧠 TIME
+# =========================
+
+def now():
+    return int(time.time()), datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# =========================
+# 🧠 DUPLICATE
 # =========================
 
 def is_duplicate(event_id):
+    if not event_id:
+        return True
     if event_id in processed_events:
         return True
     processed_events.add(event_id)
     return False
 
 # =========================
-# 🕒 TIME ENGINE (LOCKED)
+# 🤖 AI (CONTROLLED)
 # =========================
 
-def get_time():
+def ai_missing(fields):
+    return f"⚠️ 請補資料：{', '.join(fields)}"
 
-    ts = int(time.time())
-    dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    return ts, dt
-
-# =========================
-# 🧠 SAFE NLP PARSER
-# =========================
-
-def safe_parse(ai_output):
-
-    try:
-        if not ai_output or not isinstance(ai_output, dict):
-            return fallback("invalid_ai_output")
-
-        if not ai_output.get("ok"):
-            return fallback(ai_output.get("reason", "ai_failed"))
-
-        if ai_output.get("action") not in ALLOWED_ACTIONS:
-            return fallback("invalid_action")
-
-        return ai_output
-
-    except Exception:
-        return fallback("parse_exception")
-
-
-def fallback(reason):
-    return {
-        "action": "fallback",
-        "reason": reason,
-        "suggestion": "請使用：買 / 查 / 改 / 刪"
-    }
+def ai_log(msg):
+    return f"LOG分析：{msg}"
 
 # =========================
-# 📊 LOG WRITER
+# 🧪 VALIDATION
 # =========================
 
-def write_log(sheet, log):
+def validate(action, data):
 
-    ts, dt = get_time()
+    required = SCHEMA.get(action, [])
+    missing = []
 
-    row = [
-        log.get("log_id", "")[:6],
-        ts,
-        dt,
-        log.get("type", ""),
-        log.get("event_id", ""),
-        log.get("stage", ""),
-        log.get("message", ""),
-        log.get("ai_analysis", ""),
-        log.get("status", "ok")
-    ]
+    for f in required:
+        if f not in data or data[f] in ["", None, 0]:
+            missing.append(f)
 
-    safe_write(sheet, row)
+    return len(missing) == 0, missing
 
 # =========================
-# 🧾 SHEET SAFE WRITE
+# 📊 LOG (mock)
 # =========================
 
-def safe_write(sheet, row):
-
-    for _ in range(MAX_RETRY):
-        try:
-            sheet.append_row(row)
-            return True
-        except Exception:
-            time.sleep(0.5)
-
-    return False
+def write_log(log):
+    print("LOG:", log)
 
 # =========================
-# 🧠 CORE HANDLER
+# 🧠 CORE ENGINE
 # =========================
 
-def handle_event(event, sheet_order, sheet_log):
+def handle_event(event):
 
-    event_id = event.get("id")
+    event_id = event.get("id","")
+    text = event.get("message","")
 
-    # 🟢 1. 防重複
     if is_duplicate(event_id):
-        return "DUPLICATE IGNORED"
+        return "duplicate ignored"
 
-    # 🟢 2. AI parse
-    ai = call_ai(event.get("message", ""))
-    parsed = safe_parse(ai)
+    parsed = unit_engine(text)
 
-    # 🟢 3. fallback
-    if parsed["action"] == "fallback":
+    ok, missing = validate("create_order", parsed)
 
-        write_log(sheet_log, {
-            "log_id": event_id,
-            "type": "FALLBACK",
-            "event_id": event_id,
-            "stage": "NLP",
-            "message": parsed["reason"],
-            "ai_analysis": parsed["suggestion"],
-            "status": "ok"
-        })
+    if not ok:
+        return ai_missing(missing)
 
-        return "⚠️ 請補資料"
+    ts, dt = now()
 
-    # 🟢 4. ROUTER
-    try:
+    write_log({
+        "id": event_id,
+        "product": parsed["product"],
+        "qty": parsed["qty"],
+        "unit": parsed["unit"],
+        "time": dt
+    })
 
-        if parsed["action"] == "create_order":
-            result = create_order(parsed, sheet_order)
-
-        elif parsed["action"] == "create_user":
-            result = create_user(parsed)
-
-        elif parsed["action"] == "create_product":
-            result = create_product(parsed)
-
-        elif parsed["action"] == "query":
-            result = query(parsed)
-
-        elif parsed["action"] == "update":
-            result = update(parsed)
-
-        elif parsed["action"] == "delete":
-            result = delete(parsed)
-
-        write_log(sheet_log, {
-            "log_id": event_id,
-            "type": "DONE",
-            "event_id": event_id,
-            "stage": "ENGINE",
-            "message": "success",
-            "ai_analysis": parsed["action"],
-            "status": "ok"
-        })
-
-        return result
-
-    except Exception as e:
-
-        write_log(sheet_log, {
-            "log_id": event_id,
-            "type": "ERROR",
-            "event_id": event_id,
-            "stage": "EXCEPTION",
-            "message": str(e),
-            "ai_analysis": "system_error",
-            "status": "fail"
-        })
-
-        return "⚠️ 系統錯誤"
+    return f"✔ 已建立訂單：{parsed['product']} x{parsed['qty']} ({parsed['unit']})"
 
 # =========================
-# 🧠 PLACEHOLDERS
+# 🌐 ROUTE
 # =========================
 
-def call_ai(text):
-    return {"ok": False}
+@app.route("/", methods=["GET"])
+def home():
+    return "LINE POS READY"
 
-def create_order(parsed, sheet):
-    return "ORDER OK"
+@app.route("/webhook", methods=["POST"])
+def webhook():
 
-def create_user(parsed):
-    return "USER OK"
+    data = request.get_json()
 
-def create_product(parsed):
-    return "PRODUCT OK"
+    return handle_event(data)
 
-def query(parsed):
-    return "QUERY OK"
+# =========================
+# RUN
+# =========================
 
-def update(parsed):
-    return "UPDATE OK"
-
-def delete(parsed):
-    return "DELETE OK"
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
