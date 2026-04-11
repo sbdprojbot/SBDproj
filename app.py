@@ -1,290 +1,208 @@
-from flask import Flask, request, jsonify
-import os, json, uuid, re, time
+import time
 from datetime import datetime
-import threading
-
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-
-from linebot import LineBotApi
-from linebot.models import TextSendMessage
-
-import openai
-
-app = Flask(__name__)
 
 # =========================
-LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+# 🧠 GLOBAL SAFETY STATE
+# =========================
 
-line_bot_api = LineBotApi(LINE_TOKEN)
-openai.api_key = OPENAI_API_KEY
+processed_events = set()
+MAX_RETRY = 3
+
+ALLOWED_ACTIONS = {
+    "create_order",
+    "create_user",
+    "create_product",
+    "query",
+    "update",
+    "delete"
+}
 
 # =========================
-lock = threading.Lock()
-session = {}
-seen = {}
+# 🟢 DUPLICATE GUARD
+# =========================
 
-SESSION_TTL = 600  # 10 min
+def is_duplicate(event_id):
+    if event_id in processed_events:
+        return True
+    processed_events.add(event_id)
+    return False
 
 # =========================
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
-]
+# 🕒 TIME ENGINE (LOCKED)
+# =========================
 
-creds = ServiceAccountCredentials.from_json_keyfile_dict(
-    json.loads(os.getenv("GOOGLE_CREDS_JSON")),
-    scope
-)
+def get_time():
 
-gs = gspread.authorize(creds)
-sheet = gs.open_by_key(SHEET_ID)
+    ts = int(time.time())
+    dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return ts, dt
 
 # =========================
-def ws(name, cols):
+# 🧠 SAFE NLP PARSER
+# =========================
+
+def safe_parse(ai_output):
+
     try:
-        w = sheet.worksheet(name)
-    except:
-        w = sheet.add_worksheet(title=name, rows=5000, cols=len(cols))
-        w.append_row(cols)
-    return w
+        if not ai_output or not isinstance(ai_output, dict):
+            return fallback("invalid_ai_output")
 
-user_ws = ws("user", ["user_id","name","phone","address","time"])
-product_ws = ws("product", ["product_id","product","price","status","time"])
-order_ws = ws("order", ["order_id","user","product","qty","price","total","status","time"])
+        if not ai_output.get("ok"):
+            return fallback(ai_output.get("reason", "ai_failed"))
 
-# =========================
-def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if ai_output.get("action") not in ALLOWED_ACTIONS:
+            return fallback("invalid_action")
 
-def safe_append(ws, row):
-    with lock:
-        ws.append_row(row)
+        return ai_output
 
-def uid_key(uid):
-    return uid
+    except Exception:
+        return fallback("parse_exception")
 
-# =========================
-# SESSION ENGINE
-# =========================
-def get_session(uid):
-    s = session.get(uid)
 
-    if not s:
-        s = {
-            "state": "IDLE",
-            "buffer": {},
-            "ts": time.time()
-        }
-        session[uid] = s
-
-    # TTL reset
-    if time.time() - s["ts"] > SESSION_TTL:
-        s["state"] = "IDLE"
-        s["buffer"] = {}
-
-    s["ts"] = time.time()
-    return s
+def fallback(reason):
+    return {
+        "action": "fallback",
+        "reason": reason,
+        "suggestion": "請使用：買 / 查 / 改 / 刪"
+    }
 
 # =========================
-# INTENT DETECTOR
+# 📊 LOG WRITER
 # =========================
-def detect_intent(text):
 
-    if "查" in text or "訂單" in text:
-        return "QUERY"
+def write_log(sheet, log):
 
-    if any(k in text for k in ["買","要","訂"]):
-        return "ORDER"
+    ts, dt = get_time()
 
-    return "CHAT"
+    row = [
+        log.get("log_id", "")[:6],
+        ts,
+        dt,
+        log.get("type", ""),
+        log.get("event_id", ""),
+        log.get("stage", ""),
+        log.get("message", ""),
+        log.get("ai_analysis", ""),
+        log.get("status", "ok")
+    ]
 
-# =========================
-# PARSER
-# =========================
-def parse_full_order(text):
-
-    product = None
-    qty = None
-
-    if "紅茶" in text:
-        product = "紅茶"
-
-    m = re.search(r"\d+", text)
-    if m:
-        qty = int(m.group())
-
-    return product, qty
+    safe_write(sheet, row)
 
 # =========================
-def is_confirm(text):
-    return text.lower() in ["確認","ok","okay","yes","y","好"]
-
+# 🧾 SHEET SAFE WRITE
 # =========================
-def get_price(product):
 
-    rows = product_ws.get_all_records()
-    for r in rows:
-        if r.get("product") == product:
-            return float(r.get("price",0))
-    return None
+def safe_write(sheet, row):
 
-# =========================
-# STATE MACHINE
-# =========================
-def state_router(text, sess):
-
-    state = sess["state"]
-
-    # FULL SENTENCE FAST PATH
-    product, qty = parse_full_order(text)
-    if product and qty:
-        sess["buffer"] = {"product": product, "qty": qty}
-        sess["state"] = "CONFIRM"
-        return f"{product} {qty}杯，是否確認？"
-
-    # IDLE
-    if state == "IDLE":
-
-        intent = detect_intent(text)
-
-        if intent == "ORDER":
-            product, _ = parse_full_order(text)
-
-            if not product:
-                sess["state"] = "WAIT_PRODUCT"
-                return "請問要買什麼？"
-
-            sess["buffer"]["product"] = product
-            sess["state"] = "WAIT_QTY"
-            return "要幾杯？"
-
-        if intent == "QUERY":
-            return "🔍 查詢功能處理中"
-
-        return "你好～請告訴我要買什麼"
-
-    # WAIT_PRODUCT
-    if state == "WAIT_PRODUCT":
-        product, _ = parse_full_order(text)
-
-        if not product:
-            return "請提供商品名稱"
-
-        sess["buffer"]["product"] = product
-        sess["state"] = "WAIT_QTY"
-        return "要幾杯？"
-
-    # WAIT_QTY
-    if state == "WAIT_QTY":
-
-        product = sess["buffer"].get("product")
-        m = re.search(r"\d+", text)
-
-        if not m:
-            return "請輸入數量"
-
-        qty = int(m.group())
-
-        sess["buffer"]["qty"] = qty
-        sess["state"] = "CONFIRM"
-
-        return f"{product} {qty}杯，是否確認？"
-
-    # CONFIRM
-    if state == "CONFIRM":
-
-        if is_confirm(text):
-
-            sess["state"] = "DONE"
-            return "🧾 已完成訂單"
-
-        sess["state"] = "IDLE"
-        sess["buffer"] = {}
-        return "已取消"
-
-    # DONE
-    if state == "DONE":
-        sess["state"] = "IDLE"
-        sess["buffer"] = {}
-        return "需要再下一單嗎？"
-
-    return "⚠️ 無法理解"
-
-# =========================
-def create_order(uid, sess):
-
-    oid = "d" + uuid.uuid4().hex[:6]
-
-    product = sess["buffer"].get("product")
-    qty = sess["buffer"].get("qty", 1)
-
-    price = get_price(product)
-
-    if price is None:
-        return "⚠️ 產品不存在"
-
-    total = price * qty
-
-    safe_append(order_ws,[
-        oid,
-        uid,
-        product,
-        qty,
-        price,
-        total,
-        "ok",
-        now()
-    ])
-
-    return f"🧾 OK {oid} ${total}"
-
-# =========================
-@app.route("/callback", methods=["POST"])
-def callback():
-
-    body = request.get_json()
-
-    for e in body.get("events", []):
-
-        uid = e["source"]["userId"]
-        mid = e["message"]["id"]
-        text = e["message"]["text"]
-
-        key = uid + mid
-        if key in seen:
-            continue
-        seen[key] = time.time()
-
-        sess = get_session(uid)
-
-        reply = state_router(text, sess)
-
-        # CONFIRM trigger order
-        if "已完成訂單" in reply:
-            reply = create_order(uid, sess)
-
+    for _ in range(MAX_RETRY):
         try:
-            line_bot_api.reply_message(
-                e["replyToken"],
-                TextSendMessage(text=reply)
-            )
-        except:
-            pass
+            sheet.append_row(row)
+            return True
+        except Exception:
+            time.sleep(0.5)
 
-    return "OK"
+    return False
 
 # =========================
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "version": "v20.9.3-stable",
-        "mode": "state-machine-pro"
-    })
+# 🧠 CORE HANDLER
+# =========================
 
-@app.route("/")
-def home():
-    return "v20.9.3 STABLE READY"
+def handle_event(event, sheet_order, sheet_log):
+
+    event_id = event.get("id")
+
+    # 🟢 1. 防重複
+    if is_duplicate(event_id):
+        return "DUPLICATE IGNORED"
+
+    # 🟢 2. AI parse
+    ai = call_ai(event.get("message", ""))
+    parsed = safe_parse(ai)
+
+    # 🟢 3. fallback
+    if parsed["action"] == "fallback":
+
+        write_log(sheet_log, {
+            "log_id": event_id,
+            "type": "FALLBACK",
+            "event_id": event_id,
+            "stage": "NLP",
+            "message": parsed["reason"],
+            "ai_analysis": parsed["suggestion"],
+            "status": "ok"
+        })
+
+        return "⚠️ 請補資料"
+
+    # 🟢 4. ROUTER
+    try:
+
+        if parsed["action"] == "create_order":
+            result = create_order(parsed, sheet_order)
+
+        elif parsed["action"] == "create_user":
+            result = create_user(parsed)
+
+        elif parsed["action"] == "create_product":
+            result = create_product(parsed)
+
+        elif parsed["action"] == "query":
+            result = query(parsed)
+
+        elif parsed["action"] == "update":
+            result = update(parsed)
+
+        elif parsed["action"] == "delete":
+            result = delete(parsed)
+
+        write_log(sheet_log, {
+            "log_id": event_id,
+            "type": "DONE",
+            "event_id": event_id,
+            "stage": "ENGINE",
+            "message": "success",
+            "ai_analysis": parsed["action"],
+            "status": "ok"
+        })
+
+        return result
+
+    except Exception as e:
+
+        write_log(sheet_log, {
+            "log_id": event_id,
+            "type": "ERROR",
+            "event_id": event_id,
+            "stage": "EXCEPTION",
+            "message": str(e),
+            "ai_analysis": "system_error",
+            "status": "fail"
+        })
+
+        return "⚠️ 系統錯誤"
+
+# =========================
+# 🧠 PLACEHOLDERS
+# =========================
+
+def call_ai(text):
+    return {"ok": False}
+
+def create_order(parsed, sheet):
+    return "ORDER OK"
+
+def create_user(parsed):
+    return "USER OK"
+
+def create_product(parsed):
+    return "PRODUCT OK"
+
+def query(parsed):
+    return "QUERY OK"
+
+def update(parsed):
+    return "UPDATE OK"
+
+def delete(parsed):
+    return "DELETE OK"
