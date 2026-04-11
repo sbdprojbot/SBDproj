@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
-import os, json, re, time, threading
-from datetime import datetime, date
+import os, json, re, threading
+from datetime import datetime
 from queue import Queue
 
 import gspread
@@ -24,24 +24,16 @@ openai.api_key = OPENAI_API_KEY
 line_bot_api = LineBotApi(LINE_TOKEN)
 
 # =========================
-# COST CONTROL
+# CONFIG
 # =========================
 MAX_AI_CALLS = 300
 ai_calls = 0
 
-# =========================
-# QUEUE (ASYNC CORE)
-# =========================
 task_queue = Queue()
-
-# =========================
-# CACHE
-# =========================
 ai_cache = {}
-event_cache = set()
 
 # =========================
-# SHEET
+# SHEET INIT
 # =========================
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -57,33 +49,69 @@ gs = gspread.authorize(creds)
 sheet = gs.open_by_key(SHEET_ID)
 
 # =========================
-# TIME
+# SHEET SAFETY
 # =========================
-def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def get_or_create_ws(name, cols):
+    try:
+        ws = sheet.worksheet(name)
+    except:
+        ws = sheet.add_worksheet(title=name, rows=1000, cols=len(cols))
+        ws.append_row(cols)
+    return ws
+
+order_ws = get_or_create_ws(
+    "order",
+    ["order_id","time","user_id","name","product","qty","status"]
+)
+
+log_ws = get_or_create_ws(
+    "log",
+    ["time","type","message"]
+)
 
 # =========================
-# FAST REPLY
+# LOGGING SAFE
 # =========================
-def safe_reply(token, text):
+def log_error(err_type, msg):
     try:
-        line_bot_api.reply_message(token, TextSendMessage(text=text))
+        log_ws.append_row([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            err_type,
+            str(msg)[:500]
+        ])
     except:
         pass
 
 # =========================
-# EVENT DEDUP
+# FAST REPLY
 # =========================
-def is_duplicate(event_id):
-    if not event_id:
-        return False
-    if event_id in event_cache:
-        return True
-    event_cache.add(event_id)
-    return False
+def reply(token, text):
+    try:
+        line_bot_api.reply_message(token, TextSendMessage(text=text))
+    except Exception as e:
+        log_error("LINE_REPLY_FAIL", e)
 
 # =========================
-# AI PARSER
+# SIMPLE PARSER
+# =========================
+def parse(text):
+    try:
+        m = re.search(r"(.*)買(.*?)(\d+)", text)
+        if m:
+            return {
+                "name": m.group(1),
+                "items": [{
+                    "product": m.group(2),
+                    "qty": int(m.group(3))
+                }]
+            }
+        return None
+    except Exception as e:
+        log_error("PARSE_FAIL", e)
+        return None
+
+# =========================
+# AI FALLBACK
 # =========================
 def ai_parse(text):
     global ai_calls
@@ -100,7 +128,7 @@ def ai_parse(text):
             messages=[{
                 "role": "user",
                 "content": f"""
-JSON only:
+JSON ONLY:
 {text}
 format:
 {{"name":"","items":[{{"product":"","qty":1}}]}}
@@ -111,52 +139,64 @@ format:
 
         ai_calls += 1
 
-        data = json.loads(re.search(r"\{.*\}", res.choices[0].message.content, re.S).group())
+        data = json.loads(
+            re.search(r"\{.*\}", res.choices[0].message.content, re.S).group()
+        )
 
         ai_cache[text] = data
         return data
 
-    except:
+    except Exception as e:
+        log_error("AI_PARSE_FAIL", e)
         return None
 
 # =========================
-# WORKER (ASYNC BACKGROUND)
+# WRITE ORDER (RETRY)
+# =========================
+def write_order(data, user_id):
+    try:
+        oid = "D" + datetime.now().strftime("%Y%m%d%H%M%S")
+
+        for item in data["items"]:
+            order_ws.append_row([
+                oid,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                user_id,
+                data.get("name", ""),
+                item["product"],
+                item["qty"],
+                "confirmed"
+            ])
+
+    except Exception as e:
+        log_error("SHEET_WRITE_FAIL", e)
+
+# =========================
+# WORKER
 # =========================
 def worker():
     while True:
         task = task_queue.get()
-        if task is None:
-            continue
 
         try:
-            user_id = task["user_id"]
             text = task["text"]
+            user_id = task["user_id"]
 
-            data = ai_parse(text)
+            data = parse(text)
+
+            if not data:
+                data = ai_parse(text)
 
             if data:
-                # write sheet
-                ws = sheet.worksheet("order") if "order" in [w.title for w in sheet.worksheets()] else sheet.add_worksheet("order", 1000, 7)
-
-                oid = "D" + datetime.now().strftime("%Y%m%d%H%M%S")
-
-                for item in data["items"]:
-                    ws.append_row([
-                        oid,
-                        now(),
-                        user_id,
-                        data.get("name","unknown"),
-                        item["product"],
-                        item["qty"],
-                        "confirmed"
-                    ])
+                write_order(data, user_id)
+            else:
+                log_error("PARSE_EMPTY", text)
 
         except Exception as e:
-            pass
+            log_error("WORKER_FAIL", e)
 
         task_queue.task_done()
 
-# start worker
 threading.Thread(target=worker, daemon=True).start()
 
 # =========================
@@ -174,28 +214,15 @@ def callback():
             if e["type"] != "message":
                 continue
 
-            event_id = e.get("webhookEventId")
-            if is_duplicate(event_id):
-                continue
+            reply(e["replyToken"], "✅ 已收到，處理中")
 
-            user_id = e["source"]["userId"]
-            text = e["message"]["text"]
-
-            # =========================
-            # FAST REPLY (IMPORTANT)
-            # =========================
-            safe_reply(e["replyToken"], "✅ 已收到，處理中")
-
-            # =========================
-            # PUSH TO QUEUE
-            # =========================
             task_queue.put({
-                "user_id": user_id,
-                "text": text
+                "text": e["message"]["text"],
+                "user_id": e["source"]["userId"]
             })
 
-        except:
-            pass
+        except Exception as ex:
+            log_error("WEBHOOK_FAIL", ex)
 
     return "OK"
 
@@ -206,10 +233,8 @@ def callback():
 def health():
     return jsonify({
         "status": "ok",
-        "queue_size": task_queue.qsize(),
-        "ai_calls": ai_calls,
-        "cache_size": len(ai_cache),
-        "time": now()
+        "queue": task_queue.qsize(),
+        "ai_calls": ai_calls
     })
 
 # =========================
