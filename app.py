@@ -1,49 +1,284 @@
-Using cached wrapt-2.1.2-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl (120 kB)
-Using cached frozenlist-1.8.0-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl (231 kB)
-Using cached future-1.0.0-py3-none-any.whl (491 kB)
-Using cached google_auth-2.49.2-py3-none-any.whl (240 kB)
-Using cached cryptography-46.0.7-cp311-abi3-manylinux_2_34_x86_64.whl (4.5 MB)
-Using cached cffi-2.0.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (219 kB)
-Using cached google_auth_oauthlib-1.3.1-py3-none-any.whl (19 kB)
-Using cached h11-0.16.0-py3-none-any.whl (37 kB)
-Using cached httplib2-0.31.2-py3-none-any.whl (91 kB)
-Using cached pyparsing-3.3.2-py3-none-any.whl (122 kB)
-Using cached itsdangerous-2.2.0-py3-none-any.whl (16 kB)
-Using cached jinja2-3.1.6-py3-none-any.whl (134 kB)
-Using cached markupsafe-3.0.3-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (23 kB)
-Using cached propcache-0.4.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (201 kB)
-Using cached pyasn1-0.6.3-py3-none-any.whl (83 kB)
-Using cached pyasn1_modules-0.4.2-py3-none-any.whl (181 kB)
-Using cached requests_oauthlib-2.0.0-py2.py3-none-any.whl (24 kB)
-Using cached oauthlib-3.3.1-py3-none-any.whl (160 kB)
-Using cached rsa-4.9.1-py3-none-any.whl (34 kB)
-Using cached six-1.17.0-py2.py3-none-any.whl (11 kB)
-Using cached tqdm-4.67.3-py3-none-any.whl (78 kB)
-Using cached typing_inspection-0.4.2-py3-none-any.whl (14 kB)
-Using cached werkzeug-3.1.8-py3-none-any.whl (226 kB)
-Using cached packaging-26.0-py3-none-any.whl (74 kB)
-Using cached pycparser-3.0-py3-none-any.whl (48 kB)
-Using cached sniffio-1.3.1-py3-none-any.whl (10 kB)
-Installing collected packages: aenum, wrapt, urllib3, typing-extensions, tqdm, sniffio, six, pyparsing, pycparser, pyasn1, propcache, packaging, oauthlib, multidict, markupsafe, jiter, itsdangerous, idna, h11, future, frozenlist, distro, click, charset_normalizer, certifi, blinker, attrs, annotated-types, aiohappyeyeballs, yarl, werkzeug, typing-inspection, rsa, requests, python_dateutil, pydantic-core, pyasn1-modules, jinja2, httplib2, httpcore, gunicorn, Deprecated, cffi, anyio, aiosignal, requests-oauthlib, pydantic, oauth2client, httpx, flask, cryptography, aiohttp, openai, line-bot-sdk, google-auth, google-auth-oauthlib, gspread
-Successfully installed Deprecated-1.3.1 aenum-3.1.17 aiohappyeyeballs-2.6.1 aiohttp-3.13.5 aiosignal-1.4.0 annotated-types-0.7.0 anyio-4.13.0 attrs-26.1.0 blinker-1.9.0 certifi-2026.2.25 cffi-2.0.0 charset_normalizer-3.4.7 click-8.3.2 cryptography-46.0.7 distro-1.9.0 flask-3.1.3 frozenlist-1.8.0 future-1.0.0 google-auth-2.49.2 google-auth-oauthlib-1.3.1 gspread-6.2.1 gunicorn-25.3.0 h11-0.16.0 httpcore-1.0.9 httplib2-0.31.2 httpx-0.28.1 idna-3.11 itsdangerous-2.2.0 jinja2-3.1.6 jiter-0.14.0 line-bot-sdk-3.23.0 markupsafe-3.0.3 multidict-6.7.1 oauth2client-4.1.3 oauthlib-3.3.1 openai-2.31.0 packaging-26.0 propcache-0.4.1 pyasn1-0.6.3 pyasn1-modules-0.4.2 pycparser-3.0 pydantic-2.12.5 pydantic-core-2.41.5 pyparsing-3.3.2 python_dateutil-2.9.0.post0 requests-2.33.1 requests-oauthlib-2.0.0 rsa-4.9.1 six-1.17.0 sniffio-1.3.1 tqdm-4.67.3 typing-extensions-4.15.0 typing-inspection-0.4.2 urllib3-2.6.3 werkzeug-3.1.8 wrapt-2.1.2 yarl-1.23.0
-[notice] A new release of pip is available: 25.3 -> 26.0.1
-[notice] To update, run: pip install --upgrade pip
-==> Uploading build...
-==> Uploaded in 9.8s. Compression took 5.3s
-==> Build successful 🎉
-==> Deploying...
-==> Setting WEB_CONCURRENCY=1 by default, based on available CPUs in the instance
-==> Running 'gunicorn app:app -b 0.0.0.0:10000'
-[2026-04-11 11:09:46 +0000] [44] [INFO] Starting gunicorn 25.3.0
-[2026-04-11 11:09:46 +0000] [44] [INFO] Listening at: http://0.0.0.0:10000 (44)
-[2026-04-11 11:09:46 +0000] [44] [INFO] Using worker: sync
-[2026-04-11 11:09:46 +0000] [45] [INFO] Booting worker with pid: 45
-Menu
-[2026-04-11 11:09:46 +0000] [44] [INFO] Control socket listening at /opt/render/.gunicorn/gunicorn.ctl
-[2026-04-11 11:10:18 +0000] [44] [INFO] Handling signal: term
-[2026-04-11 11:10:18 +0000] [45] [INFO] Worker exiting (pid: 45)
-[2026-04-11 11:10:21 +0000] [44] [INFO] Shutting down: Master
-==> Port scan timeout reached, no open ports detected. Bind your service to at least one port. If you don't need to receive traffic on any port, create a background worker instead.
-==> Docs on specifying a port: https://render.com/docs/web-services#port-binding
-==> Timed Out
-==> Common ways to troubleshoot your deploy: https://render.com/docs/troubleshooting-deploys
+from flask import Flask, request
+import os
+import json
+from datetime import datetime
+
+import openai
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+from linebot import LineBotApi, WebhookHandler
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+
+# =========================
+# APP INIT
+# =========================
+app = Flask(__name__)
+
+# =========================
+# ENV
+# =========================
+LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+
+openai.api_key = OPENAI_API_KEY
+
+line_bot_api = LineBotApi(LINE_TOKEN)
+handler = WebhookHandler(LINE_SECRET)
+
+# =========================
+# HEALTH CHECK
+# =========================
+@app.route("/")
+def home():
+    return "OK"
+
+# =========================
+# GOOGLE SHEET AUTH
+# =========================
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds_dict = json.loads(os.getenv("GOOGLE_CREDS_JSON"))
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+
+gs_client = gspread.authorize(creds)
+sheet = gs_client.open_by_key(SHEET_ID)
+
+# =========================
+# TIME
+# =========================
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# =========================
+# AI PARSER（多商品）
+# =========================
+def parse_order(text):
+    prompt = f"""
+將使用者輸入轉 JSON（可多商品）：
+
+{text}
+
+格式：
+{{
+  "name": "",
+  "items": [
+    {{"product": "", "qty": 1}}
+  ]
+}}
+
+只輸出 JSON
+"""
+
+    try:
+        res = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+        return json.loads(res.choices[0].message.content)
+    except:
+        return None
+
+# =========================
+# 價格表（可未來改 Sheet）
+# =========================
+PRICE_MAP = {
+    "牛奶": 30,
+    "麵包": 25,
+    "水": 20
+}
+
+# =========================
+# MEMBER（含地址）
+# =========================
+def upsert_member(user_id, name, address=None):
+    try:
+        ws = sheet.worksheet("member")
+    except:
+        ws = sheet.add_worksheet("member", rows="1000", cols="10")
+        ws.append_row(["user_id", "name", "phone", "address", "created_at", "updated_at", "note"])
+
+    rows = ws.get_all_values()
+
+    for i, r in enumerate(rows):
+        if i == 0:
+            continue
+        if r[0] == user_id:
+            ws.update_cell(i+1, 2, name)
+            if address:
+                ws.update_cell(i+1, 4, address)
+            ws.update_cell(i+1, 6, now())
+            return
+
+    ws.append_row([user_id, name, "", address or "", now(), now(), ""])
+
+# =========================
+# ADDRESS DETECTION
+# =========================
+def detect_address(text):
+    if "地址" in text or "住在" in text or "住址" in text:
+        return text.split("是")[-1].strip()
+    return None
+
+# =========================
+# WRITE ORDER
+# =========================
+def write_order(user_id, data):
+    try:
+        ws = sheet.worksheet("order")
+    except:
+        ws = sheet.add_worksheet("order", rows="2000", cols="10")
+        ws.append_row(["time", "user_id", "name", "product", "qty", "price", "total"])
+
+    name = data.get("name", "未知")
+    items = data.get("items", [])
+
+    upsert_member(user_id, name)
+
+    for item in items:
+        product = item["product"]
+        qty = int(item["qty"])
+        price = PRICE_MAP.get(product, 0)
+        total = price * qty
+
+        ws.append_row([
+            now(),
+            user_id,
+            name,
+            product,
+            qty,
+            price,
+            total
+        ])
+
+# =========================
+# QUERY ORDER
+# =========================
+def query(name):
+    ws = sheet.worksheet("order")
+    rows = ws.get_all_values()
+
+    text = f"📦 {name} 訂單\n\n"
+    total_sum = 0
+
+    for r in rows[1:]:
+        if len(r) < 7:
+            continue
+        if r[2] == name:
+            text += f"{r[3]} x{r[4]} = {r[6]}\n"
+            total_sum += int(r[6])
+
+    text += f"\n💰 總金額：{total_sum}"
+    return text
+
+# =========================
+# QUERY ADDRESS
+# =========================
+def query_address(user_id):
+    ws = sheet.worksheet("member")
+    rows = ws.get_all_values()
+
+    for r in rows[1:]:
+        if r[0] == user_id:
+            return f"🏠 你的地址：{r[3] or '未設定'}"
+
+    return "查無會員資料"
+
+# =========================
+# INTENT
+# =========================
+def intent(msg):
+    if msg in ["help", "指令"]:
+        return "help"
+    if "查詢" in msg:
+        return "query"
+    if "地址" in msg:
+        return "address"
+    return "order"
+
+# =========================
+# HELP
+# =========================
+def help_text():
+    return """🧠 LINE 訂單系統 v3-lite
+
+🧾 下單：
+小明買牛奶2瓶麵包1個
+
+🔍 查詢：
+查詢小明
+
+🏠 地址：
+住址是台北板橋文化路
+
+📊 月報（未開放）
+"""
+
+# =========================
+# WEBHOOK
+# =========================
+@app.route("/callback", methods=["POST"])
+def callback():
+    body = request.get_json()
+    events = body.get("events", [])
+
+    for e in events:
+        if e["type"] != "message":
+            continue
+
+        user_id = e["source"]["userId"]
+        text = e["message"]["text"]
+
+        try:
+            mode = intent(text)
+
+            # HELP
+            if mode == "help":
+                reply = help_text()
+
+            # ADDRESS QUERY
+            elif mode == "address":
+                addr = detect_address(text)
+                if addr:
+                    upsert_member(user_id, "未知", addr)
+                    reply = f"🏠 已更新地址：{addr}"
+                else:
+                    reply = query_address(user_id)
+
+            # ORDER QUERY
+            elif mode == "query":
+                name = text.replace("查詢", "").strip()
+                reply = query(name or "未知")
+
+            # ORDER
+            else:
+                data = parse_order(text)
+
+                if not data:
+                    reply = "❌ 無法解析訂單"
+                else:
+                    write_order(user_id, data)
+                    reply = f"✅ 已記錄訂單"
+
+        except Exception as ex:
+            reply = f"⚠️ 系統錯誤：{ex}"
+
+        line_bot_api.reply_message(
+            e["replyToken"],
+            TextSendMessage(text=reply)
+        )
+
+    return "OK"
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
