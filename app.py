@@ -24,7 +24,7 @@ line_bot_api = LineBotApi(LINE_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
 # =========================
-# SHEET AUTH
+# GOOGLE SHEET AUTH
 # =========================
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -38,7 +38,7 @@ gs_client = gspread.authorize(creds)
 sheet = gs_client.open_by_key(SHEET_ID)
 
 # =========================
-# SCHEMA (v9 防呆核心)
+# SCHEMA（自動防呆核心🔥）
 # =========================
 SCHEMA = {
     "order": ["order_id","time","user_id","name","product","qty","price","total","status"],
@@ -54,7 +54,7 @@ def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # =========================
-# SHEET AUTO FIX (v9🔥)
+# SHEET AUTO FIX（🔥核心）
 # =========================
 def ensure_sheet(name):
     try:
@@ -62,14 +62,15 @@ def ensure_sheet(name):
     except:
         return sheet.add_worksheet(title=name, rows="1000", cols="20")
 
-def fix_columns(ws, expected):
+def fix_columns(ws, cols):
     rows = ws.get_all_values()
+
     if not rows:
-        ws.append_row(expected)
+        ws.append_row(cols)
         return
 
     header = rows[0]
-    missing = [c for c in expected if c not in header]
+    missing = [c for c in cols if c not in header]
 
     if missing:
         ws.update("A1", [header + missing])
@@ -82,27 +83,32 @@ def init_sheets():
 init_sheets()
 
 # =========================
-# PRICE FROM PRODUCT SHEET
+# PRODUCT PRICE (Sheet driven)
 # =========================
 def get_price(product):
     try:
         ws = sheet.worksheet("product")
         rows = ws.get_all_values()
         for r in rows[1:]:
-            if r[1] == product:
+            if len(r) >= 3 and r[1] == product:
                 return int(r[2])
     except:
         pass
     return 0
 
 # =========================
-# AI PARSER
+# AI PARSER（穩定版🔥）
 # =========================
 def parse_order(text):
     prompt = f"""
-轉 JSON（可多商品）：
+你是訂單解析器。
 
-{text}
+請把輸入轉成 JSON：
+
+規則：
+- 只能輸出 JSON
+- 不要說明
+- 不要 markdown
 
 格式：
 {{
@@ -111,28 +117,35 @@ def parse_order(text):
     {{"product": "", "qty": 1}}
   ]
 }}
-只輸出 JSON
+
+輸入：
+{text}
 """
+
     try:
         res = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"user","content":prompt}],
-            temperature=0
+            temperature=0,
+            response_format={"type":"json_object"}
         )
+
         return json.loads(res.choices[0].message.content)
+
     except:
         return None
 
 # =========================
-# MEMBER UPSERT
+# MEMBER SYSTEM
 # =========================
 def upsert_member(user_id, name, address=None):
     ws = sheet.worksheet("member")
     rows = ws.get_all_values()
 
     for i,r in enumerate(rows):
-        if i==0: continue
-        if r[0]==user_id:
+        if i == 0:
+            continue
+        if r[0] == user_id:
             ws.update_cell(i+1,2,name)
             if address:
                 ws.update_cell(i+1,4,address)
@@ -152,8 +165,8 @@ def write_order(user_id, data):
 
     total_all = 0
 
-    for item in data["items"]:
-        product = item["product"]
+    for item in data.get("items", []):
+        product = item.get("product","")
         qty = int(item.get("qty",1))
         price = get_price(product)
         total = price * qty
@@ -174,31 +187,31 @@ def write_order(user_id, data):
     return order_id, total_all
 
 # =========================
-# QUERY
+# QUERY SYSTEM（客服化🔥）
 # =========================
 def query(name):
     ws = sheet.worksheet("order")
     rows = ws.get_all_values()
 
-    text = f"📦 {name} 訂單\n\n"
+    result = f"📦 {name} 的訂單\n\n"
     total = 0
 
     for r in rows[1:]:
-        if len(r)<9: continue
-        if r[3]==name:
-            text += f"{r[4]} x{r[5]} = {r[7]}\n"
+        if len(r) < 9:
+            continue
+        if r[3] == name:
+            result += f"• {r[4]} x{r[5]} = {r[7]}\n"
             total += int(r[7])
 
-    text += f"\n💰 總金額：{total}"
-    return text
+    result += f"\n💰 總金額：{total}"
+    return result
 
 # =========================
 # INTENT
 # =========================
-def intent(msg):
-    if msg.startswith("修正"): return "fix"
-    if msg.startswith("刪除"): return "delete"
-    if "查詢" in msg: return "query"
+def intent(text):
+    if "查詢" in text:
+        return "query"
     return "order"
 
 # =========================
@@ -225,21 +238,18 @@ def callback():
                 reply = query(name or "未知")
 
             # ORDER
-            elif mode == "order":
+            else:
                 data = parse_order(text)
 
                 if not data:
-                    reply = "❌ 無法解析訂單"
+                    reply = "❌ 我沒聽懂你的訂單，可以再說一次嗎？"
                 else:
-                    order_id, total = write_order(user_id,data)
-                    upsert_member(user_id,data.get("name","未知"))
-                    reply = f"✅ 已建立訂單\n{order_id}\n💰 {total}"
-
-            else:
-                reply = "⚠️ 功能尚未開放"
+                    order_id, total = write_order(user_id, data)
+                    upsert_member(user_id, data.get("name","未知"))
+                    reply = f"✅ 訂單完成\n{order_id}\n💰 {total}"
 
         except Exception as ex:
-            reply = f"⚠️ 系統錯誤：{ex}"
+            reply = f"⚠️ 系統忙碌中，請稍後再試"
 
         line_bot_api.reply_message(
             e["replyToken"],
