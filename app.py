@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
-import os, json, re, threading, time, uuid
-from datetime import datetime
-from queue import Queue
+import os, json, re, uuid
+from datetime import datetime, date
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -20,18 +19,35 @@ LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-openai.api_key = OPENAI_API_KEY
 line_bot_api = LineBotApi(LINE_TOKEN)
+openai.api_key = OPENAI_API_KEY
 
 # =========================
-# STATE
+# COST CONTROL
 # =========================
-task_queue = Queue()
-worker_alive = True
-last_heartbeat = time.time()
+DAILY_LIMIT = 0.03
+TEST_LIMIT = 0.07
+COST_MODE = os.getenv("COST_MODE", "prod")
 
-ai_calls = 0
-ai_cost_estimate = 0.0
+cost_usage = {}
+
+def today():
+    return str(date.today())
+
+def limit():
+    return TEST_LIMIT if COST_MODE == "test" else DAILY_LIMIT
+
+def add_cost(v):
+    k = today()
+    cost_usage[k] = cost_usage.get(k, 0) + v
+
+def can_use_ai():
+    return cost_usage.get(today(), 0) < limit()
+
+# =========================
+# CACHE (safe in-memory)
+# =========================
+ai_cache = {}
 
 # =========================
 # SHEET INIT
@@ -58,30 +74,29 @@ def ws(name, cols):
     return w
 
 order_ws = ws("order", ["trace_id","order_id","time","user_id","name","product","qty","status"])
-log_ws = ws("log", ["time","trace_id","stage","type","message"])
-cost_ws = ws("ai_cost", ["time","trace_id","tokens","cost_est"])
+log_ws = ws("log", ["time","trace_id","stage","type","message","ai_analysis"])
 
 # =========================
-# LOG SYSTEM
+# LOG
 # =========================
-def log(trace_id, stage, type_, msg):
+def log(trace_id, stage, type_, msg, ai_analysis=""):
     row = [
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         trace_id,
         stage,
         type_,
-        str(msg)[:500]
+        str(msg)[:500],
+        ai_analysis
     ]
-
     print("LOG:", row)
 
     try:
         log_ws.append_row(row)
-    except Exception as e:
-        print("LOG FAIL:", e)
+    except:
+        pass
 
 # =========================
-# LINE REPLY
+# LINE REPLY SAFE
 # =========================
 def reply(token, msg):
     try:
@@ -90,61 +105,108 @@ def reply(token, msg):
         print("LINE FAIL:", e)
 
 # =========================
-# SIMPLE PARSER
+# RULE PARSER (FAST PATH)
 # =========================
-def parse(text):
-    m = re.search(r"(.*)買(.*?)(\d+)", text)
-    if m:
+def rule_parse(text):
+    try:
+        m = re.search(r"(.*)買(.*?)(\d+)", text)
+        if not m:
+            return None
+
         return {
-            "name": m.group(1),
+            "name": m.group(1).strip(),
             "items": [{
-                "product": m.group(2),
+                "product": m.group(2).strip(),
                 "qty": int(m.group(3))
-            }]
+            }],
+            "source": "rule"
         }
-    return None
-
-# =========================
-# AI PARSER (LIMITED)
-# =========================
-def ai_parse(text):
-    global ai_calls, ai_cost_estimate
-
-    if ai_calls >= 300:
+    except:
         return None
 
+# =========================
+# AI PARSER (HARDENED)
+# =========================
+def ai_parse(text):
+    if not can_use_ai():
+        return None
+
+    # cache hit
+    if text in ai_cache:
+        return ai_cache[text]
+
     try:
+        prompt = f"""
+你是訂單解析系統，只能輸出 JSON。
+
+格式：
+{{
+  "name": "string",
+  "items": [
+    {{"product": "string", "qty": number}}
+  ]
+}}
+
+規則：
+- 只能 JSON
+- 不要 markdown
+- 不要解釋
+
+輸入：
+{text}
+"""
+
         res = openai.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"user","content":text}]
+            messages=[{"role":"user","content":prompt}],
+            temperature=0
         )
 
-        ai_calls += 1
+        add_cost(0.001)
 
-        cost = 0.0002  # rough estimate
-        ai_cost_estimate += cost
+        content = res.choices[0].message.content.strip()
 
-        data = {
-            "raw": res.choices[0].message.content
-        }
+        # safe json extract
+        match = re.search(r"\{.*\}", content, re.S)
+        if not match:
+            raise ValueError("No JSON found")
 
+        data = json.loads(match.group())
+
+        # validation guard
+        if "items" not in data:
+            raise ValueError("Invalid schema")
+
+        data["source"] = "ai"
+
+        ai_cache[text] = data
         return data
 
     except Exception as e:
-        print("AI FAIL:", e)
+        log("NO_TRACE", "AI", "FAIL", str(e))
         return None
 
 # =========================
-# WRITE ORDER (SAFE)
+# PARSER ENTRY
+# =========================
+def parse(text):
+    data = rule_parse(text)
+    if data:
+        return data
+
+    return ai_parse(text)
+
+# =========================
+# WRITE ORDER
 # =========================
 def write_order(trace_id, data, user_id):
-    oid = "D" + datetime.now().strftime("%Y%m%d%H%M%S")
+    order_id = "D" + datetime.now().strftime("%Y%m%d%H%M%S")
 
     try:
         for item in data["items"]:
             order_ws.append_row([
                 trace_id,
-                oid,
+                order_id,
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 user_id,
                 data.get("name",""),
@@ -153,73 +215,10 @@ def write_order(trace_id, data, user_id):
                 "confirmed"
             ])
 
-        log(trace_id, "SHEET", "OK", oid)
+        log(trace_id, "SHEET", "OK", order_id)
 
     except Exception as e:
         log(trace_id, "SHEET", "FAIL", str(e))
-
-# =========================
-# WORKER (IMMORTAL LOOP)
-# =========================
-def worker():
-    global last_heartbeat, worker_alive
-
-    print("🔥 WORKER STARTED")
-
-    while True:
-        try:
-            task = task_queue.get()
-
-            trace_id = task.get("trace_id","NO_TRACE")
-
-            log(trace_id, "QUEUE", "RECEIVED", task)
-
-            text = task["text"]
-            user_id = task["user_id"]
-
-            data = parse(text)
-
-            if not data:
-                data = ai_parse(text)
-
-            if data:
-                write_order(trace_id, data, user_id)
-            else:
-                log(trace_id, "ERROR", "PARSE_FAIL", text)
-
-            last_heartbeat = time.time()
-            worker_alive = True
-
-        except Exception as e:
-            print("WORKER CRASH:", e)
-            worker_alive = False
-            time.sleep(1)
-
-        finally:
-            try:
-                task_queue.task_done()
-            except:
-                pass
-
-# =========================
-# WATCHDOG (AUTO REVIVE)
-# =========================
-def watchdog():
-    global worker_alive
-
-    while True:
-        time.sleep(30)
-
-        if time.time() - last_heartbeat > 60:
-            print("🔥 REVIVING WORKER")
-            threading.Thread(target=worker, daemon=True).start()
-            worker_alive = True
-
-# =========================
-# START
-# =========================
-threading.Thread(target=worker, daemon=True).start()
-threading.Thread(target=watchdog, daemon=True).start()
 
 # =========================
 # WEBHOOK
@@ -234,19 +233,21 @@ def callback():
         if e["type"] != "message":
             continue
 
-        trace_id = "T" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:6]
-
         text = e["message"]["text"]
+        user_id = e["source"]["userId"]
+
+        trace_id = "T" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:6]
 
         log(trace_id, "WEBHOOK", "RECEIVED", text)
 
         reply(e["replyToken"], "✅ 已收到，處理中")
 
-        task_queue.put({
-            "trace_id": trace_id,
-            "text": text,
-            "user_id": e["source"]["userId"]
-        })
+        data = parse(text)
+
+        if data:
+            write_order(trace_id, data, user_id)
+        else:
+            log(trace_id, "ERROR", "PARSE_FAIL", text)
 
     return "OK"
 
@@ -257,18 +258,17 @@ def callback():
 def health():
     return jsonify({
         "status":"ok",
-        "queue":task_queue.qsize(),
-        "ai_calls":ai_calls,
-        "ai_cost_estimate":round(ai_cost_estimate,4),
-        "worker_alive":worker_alive
+        "version":"v18.4",
+        "cost_mode": COST_MODE,
+        "today_cost": cost_usage.get(today(),0),
+        "limit": limit(),
+        "cache_size": len(ai_cache)
     })
 
 # =========================
-# ROOT
-# =========================
 @app.route("/")
 def home():
-    return "v18 production stable running"
+    return "v18.4 engineered stable AI system"
 
 # =========================
 if __name__ == "__main__":
