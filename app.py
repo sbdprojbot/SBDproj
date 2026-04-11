@@ -12,13 +12,13 @@ app = Flask(__name__)
 processed_events = set()
 
 # =========================
-# 🧠 SCHEMA
+# 🧠 SCHEMA ENGINE
 # =========================
 
 SCHEMA = {
-    "create_order": ["product", "qty"],
-    "create_product": ["product", "price"],
-    "create_user": ["name", "phone"]
+    "order": ["product", "qty"],
+    "product": ["product", "price"],
+    "user": ["name", "phone"]
 }
 
 # =========================
@@ -42,8 +42,7 @@ UNIT_MAP = {
     "杯":"cup",
     "瓶":"bottle",
     "個":"piece",
-    "份":"set",
-    "碗":"bowl"
+    "份":"set"
 }
 
 NOISE = ["我要","幫我","請","來","買","給我"]
@@ -61,7 +60,6 @@ def parse_unit(text):
     for k,v in NUM_MAP.items():
         if k in text:
             qty = v
-            break
 
     for k,v in UNIT_MAP.items():
         if k in text:
@@ -91,14 +89,7 @@ def unit_engine(text):
     }
 
 # =========================
-# 🧠 TIME
-# =========================
-
-def now():
-    return int(time.time()), datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-# =========================
-# 🧠 DUPLICATE
+# 🧠 DEDUP
 # =========================
 
 def is_duplicate(event_id):
@@ -110,17 +101,14 @@ def is_duplicate(event_id):
     return False
 
 # =========================
-# 🤖 AI (CONTROLLED)
+# 🧠 TIME
 # =========================
 
-def ai_missing(fields):
-    return f"⚠️ 請補資料：{', '.join(fields)}"
-
-def ai_log(msg):
-    return f"LOG分析：{msg}"
+def now():
+    return int(time.time()), datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # =========================
-# 🧪 VALIDATION
+# 🧠 VALIDATION
 # =========================
 
 def validate(action, data):
@@ -135,11 +123,45 @@ def validate(action, data):
     return len(missing) == 0, missing
 
 # =========================
-# 📊 LOG (mock)
+# 🤖 AI LOG (SAFE ONLY)
 # =========================
 
-def write_log(log):
-    print("LOG:", log)
+def ai_log(log):
+
+    if log["type"] == "MISSING":
+        return "缺少欄位：" + ",".join(log.get("missing_fields", []))
+
+    if log["type"] == "ERROR":
+        return "系統錯誤，需要檢查Sheet / API"
+
+    return "正常運行"
+
+# =========================
+# 📊 LOG BUILDER
+# =========================
+
+def build_log(event, parsed, log_type, missing=None):
+
+    ts, dt = now()
+
+    log = {
+        "log_id": event.get("id",""),
+        "timestamp": ts,
+        "display_time": dt,
+        "type": log_type,
+        "level": "INFO" if log_type=="ORDER" else "WARN",
+        "stage": "ENGINE",
+        "message": event.get("message",""),
+        "parsed": parsed,
+        "missing_fields": missing or [],
+        "ai_summary": "",
+        "ai_suggestion": ""
+    }
+
+    log["ai_summary"] = ai_log(log)
+    log["ai_suggestion"] = "check schema or sheet"
+
+    return log
 
 # =========================
 # 🧠 CORE ENGINE
@@ -155,22 +177,15 @@ def handle_event(event):
 
     parsed = unit_engine(text)
 
-    ok, missing = validate("create_order", parsed)
+    ok, missing = validate("order", parsed)
 
     if not ok:
-        return ai_missing(missing)
+        log = build_log(event, parsed, "MISSING", missing)
+        return "⚠️ 請補資料：" + ",".join(missing)
 
-    ts, dt = now()
+    log = build_log(event, parsed, "ORDER")
 
-    write_log({
-        "id": event_id,
-        "product": parsed["product"],
-        "qty": parsed["qty"],
-        "unit": parsed["unit"],
-        "time": dt
-    })
-
-    return f"✔ 已建立訂單：{parsed['product']} x{parsed['qty']} ({parsed['unit']})"
+    return f"✔ 訂單成立：{parsed['product']} x{parsed['qty']} ({parsed['unit']})"
 
 # =========================
 # 🌐 ROUTE
@@ -178,17 +193,15 @@ def handle_event(event):
 
 @app.route("/", methods=["GET"])
 def home():
-    return "LINE POS READY"
+    return "LINE POS SYSTEM READY"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-
     data = request.get_json()
-
     return handle_event(data)
 
 # =========================
-# RUN
+# 🚀 RUN
 # =========================
 
 if __name__ == "__main__":
