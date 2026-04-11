@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
-import os, json, uuid
-from datetime import datetime, date
+import os, json, uuid, re, time
+from datetime import datetime
+import threading
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -13,8 +14,6 @@ import openai
 app = Flask(__name__)
 
 # =========================
-# CONFIG
-# =========================
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
@@ -23,36 +22,12 @@ line_bot_api = LineBotApi(LINE_TOKEN)
 openai.api_key = OPENAI_API_KEY
 
 # =========================
-# COST CONTROL
-# =========================
-DAILY_LIMIT = 0.03
-cost_map = {}
-
-def today():
-    return str(date.today())
-
-def cost():
-    return cost_map.get(today(), 0)
-
-def add_cost(c=0.001):
-    cost_map[today()] = cost() + c
-
-def can_ai():
-    return cost() < DAILY_LIMIT
-
-# =========================
-# STATE (防無限迴圈)
-# =========================
+lock = threading.Lock()
 session = {}
-MAX_DEPTH = 2
+seen = {}
 
-# =========================
-# DEDUP LINE
-# =========================
-seen_msg = set()
+SESSION_TTL = 600  # 10 min
 
-# =========================
-# SHEET
 # =========================
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -67,220 +42,249 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(
 gs = gspread.authorize(creds)
 sheet = gs.open_by_key(SHEET_ID)
 
+# =========================
 def ws(name, cols):
     try:
-        return sheet.worksheet(name)
+        w = sheet.worksheet(name)
     except:
         w = sheet.add_worksheet(title=name, rows=5000, cols=len(cols))
         w.append_row(cols)
-        return w
+    return w
 
 user_ws = ws("user", ["user_id","name","phone","address","time"])
 product_ws = ws("product", ["product_id","product","price","status","time"])
 order_ws = ws("order", ["order_id","user","product","qty","price","total","status","time"])
-log_ws = ws("log", ["time","trace","stage","type","msg","diag","cost"])
 
 # =========================
-# TRACE
-# =========================
-def trace():
-    return "T" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def safe_append(ws, row):
+    with lock:
+        ws.append_row(row)
+
+def uid_key(uid):
+    return uid
 
 # =========================
-# LOG (AI診斷升級)
+# SESSION ENGINE
 # =========================
-def log(tr, stage, type_, msg, diag="", c=0):
-    try:
-        log_ws.append_row([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            tr,
-            stage,
-            type_,
-            str(msg)[:300],
-            diag,
-            c
-        ])
-    except:
-        pass
+def get_session(uid):
+    s = session.get(uid)
 
-# =========================
-# HELP / COMMAND LIST
-# =========================
-HELP_TEXT = """
-📌 指令總表
-
-🧾 訂單：
-- 王小明買紅茶2杯
-
-📦 商品：
-- 紅茶一杯25元
-
-👤 會員：
-- 王小明 電話0912...
-
-🔍 查單：
-- 查訂單
-
-✏️ 修改：
-- 改訂單 dxxxx
-
-❌ 刪除：
-- 刪訂單 dxxxx
-"""
-
-# =========================
-# AI ENGINE (會問問題 + 補資料)
-# =========================
-def ai_engine(text):
-
-    if not can_ai():
-        return {"action":"limit","reply":"⚠️ AI額度已用完"}
-
-    prompt = """
-你是AI門市員工。
-
-你可以：
-- create_user
-- create_product
-- order
-- update
-- delete
-- ask
-- fix
-
-規則：
-1. 缺資料 → ask
-2. 可補齊 → fix
-3. 不可拒絕
-4. 要主動幫忙補全
-
-輸出 JSON：
-{
-  "action": "",
-  "data": {},
-  "reply": "",
-  "ai_diagnosis": ""
-}
-"""
-
-    res = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role":"system","content":prompt},
-            {"role":"user","content":text}
-        ],
-        temperature=0
-    )
-
-    add_cost()
-
-    raw = res.choices[0].message.content
-
-    try:
-        return json.loads(raw)
-    except:
-        return {
-            "action":"ask",
-            "reply":"⚠️ 我需要更多資訊"
+    if not s:
+        s = {
+            "state": "IDLE",
+            "buffer": {},
+            "ts": time.time()
         }
+        session[uid] = s
+
+    # TTL reset
+    if time.time() - s["ts"] > SESSION_TTL:
+        s["state"] = "IDLE"
+        s["buffer"] = {}
+
+    s["ts"] = time.time()
+    return s
 
 # =========================
-# CRUD ENGINE
+# INTENT DETECTOR
 # =========================
-def handle(ai, tr):
+def detect_intent(text):
 
-    a = ai.get("action")
-    d = ai.get("data", {})
+    if "查" in text or "訂單" in text:
+        return "QUERY"
 
-    if a == "ask":
-        return ai.get("reply")
+    if any(k in text for k in ["買","要","訂"]):
+        return "ORDER"
 
-    if a == "create_product":
-        pid = "p" + uuid.uuid4().hex[:5]
-        product_ws.append_row([pid,d.get("product"),d.get("price"),"active",today()])
-        return f"📦 OK {pid}"
-
-    if a == "create_user":
-        uid = "u" + uuid.uuid4().hex[:5]
-        user_ws.append_row([uid,d.get("name"),d.get("phone"),d.get("address"),today()])
-        return f"👤 OK {uid}"
-
-    if a == "order":
-        oid = "d" + uuid.uuid4().hex[:5]
-
-        total = 0
-        for i in d.get("items", []):
-            price = 0
-            total += price * i.get("qty",1)
-            order_ws.append_row([oid,d.get("user"),i.get("product"),i.get("qty"),price,total,"ok",today()])
-
-        return f"🧾 OK {oid}"
-
-    if a == "delete":
-        return "❌ 已刪除"
-
-    if a == "update":
-        return "✏️ 已修改"
-
-    return "⚠️ 無法處理"
+    return "CHAT"
 
 # =========================
-# WEBHOOK
+# PARSER
+# =========================
+def parse_full_order(text):
+
+    product = None
+    qty = None
+
+    if "紅茶" in text:
+        product = "紅茶"
+
+    m = re.search(r"\d+", text)
+    if m:
+        qty = int(m.group())
+
+    return product, qty
+
+# =========================
+def is_confirm(text):
+    return text.lower() in ["確認","ok","okay","yes","y","好"]
+
+# =========================
+def get_price(product):
+
+    rows = product_ws.get_all_records()
+    for r in rows:
+        if r.get("product") == product:
+            return float(r.get("price",0))
+    return None
+
+# =========================
+# STATE MACHINE
+# =========================
+def state_router(text, sess):
+
+    state = sess["state"]
+
+    # FULL SENTENCE FAST PATH
+    product, qty = parse_full_order(text)
+    if product and qty:
+        sess["buffer"] = {"product": product, "qty": qty}
+        sess["state"] = "CONFIRM"
+        return f"{product} {qty}杯，是否確認？"
+
+    # IDLE
+    if state == "IDLE":
+
+        intent = detect_intent(text)
+
+        if intent == "ORDER":
+            product, _ = parse_full_order(text)
+
+            if not product:
+                sess["state"] = "WAIT_PRODUCT"
+                return "請問要買什麼？"
+
+            sess["buffer"]["product"] = product
+            sess["state"] = "WAIT_QTY"
+            return "要幾杯？"
+
+        if intent == "QUERY":
+            return "🔍 查詢功能處理中"
+
+        return "你好～請告訴我要買什麼"
+
+    # WAIT_PRODUCT
+    if state == "WAIT_PRODUCT":
+        product, _ = parse_full_order(text)
+
+        if not product:
+            return "請提供商品名稱"
+
+        sess["buffer"]["product"] = product
+        sess["state"] = "WAIT_QTY"
+        return "要幾杯？"
+
+    # WAIT_QTY
+    if state == "WAIT_QTY":
+
+        product = sess["buffer"].get("product")
+        m = re.search(r"\d+", text)
+
+        if not m:
+            return "請輸入數量"
+
+        qty = int(m.group())
+
+        sess["buffer"]["qty"] = qty
+        sess["state"] = "CONFIRM"
+
+        return f"{product} {qty}杯，是否確認？"
+
+    # CONFIRM
+    if state == "CONFIRM":
+
+        if is_confirm(text):
+
+            sess["state"] = "DONE"
+            return "🧾 已完成訂單"
+
+        sess["state"] = "IDLE"
+        sess["buffer"] = {}
+        return "已取消"
+
+    # DONE
+    if state == "DONE":
+        sess["state"] = "IDLE"
+        sess["buffer"] = {}
+        return "需要再下一單嗎？"
+
+    return "⚠️ 無法理解"
+
+# =========================
+def create_order(uid, sess):
+
+    oid = "d" + uuid.uuid4().hex[:6]
+
+    product = sess["buffer"].get("product")
+    qty = sess["buffer"].get("qty", 1)
+
+    price = get_price(product)
+
+    if price is None:
+        return "⚠️ 產品不存在"
+
+    total = price * qty
+
+    safe_append(order_ws,[
+        oid,
+        uid,
+        product,
+        qty,
+        price,
+        total,
+        "ok",
+        now()
+    ])
+
+    return f"🧾 OK {oid} ${total}"
+
 # =========================
 @app.route("/callback", methods=["POST"])
 def callback():
 
     body = request.get_json()
-    events = body.get("events", [])
 
-    for e in events:
+    for e in body.get("events", []):
 
-        if e["type"] != "message":
-            continue
-
+        uid = e["source"]["userId"]
         mid = e["message"]["id"]
-
-        if mid in seen_msg:
-            return "OK"
-        seen_msg.add(mid)
-
         text = e["message"]["text"]
-        tr = trace()
 
-        log(tr,"WEBHOOK","IN",text)
+        key = uid + mid
+        if key in seen:
+            continue
+        seen[key] = time.time()
 
-        ai = ai_engine(text)
+        sess = get_session(uid)
 
-        log(tr,"AI","RAW",ai,"AI_OK",cost())
+        reply = state_router(text, sess)
 
-        result = handle(ai, tr)
-
-        log(tr,"RESULT","OUT",result,ai.get("ai_diagnosis",""),cost())
+        # CONFIRM trigger order
+        if "已完成訂單" in reply:
+            reply = create_order(uid, sess)
 
         try:
             line_bot_api.reply_message(
                 e["replyToken"],
-                TextSendMessage(text=result)
+                TextSendMessage(text=reply)
             )
-        except Exception as ex:
-            log(tr,"LINE","FAIL",str(ex))
+        except:
+            pass
 
     return "OK"
 
 # =========================
-@app.route("/help")
-def help():
-    return HELP_TEXT
-
 @app.route("/health")
 def health():
     return jsonify({
-        "status":"ok",
-        "version":"v20.6",
-        "cost":cost(),
-        "limit":DAILY_LIMIT
+        "status": "ok",
+        "version": "v20.9.3-stable",
+        "mode": "state-machine-pro"
     })
 
 @app.route("/")
 def home():
-    return "v20.6 AI EMPLOYEE SYSTEM RUNNING"
+    return "v20.9.3 STABLE READY"
