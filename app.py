@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import os, json, re
 from datetime import datetime, date
+import uuid
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -25,20 +26,31 @@ openai.api_key = OPENAI_API_KEY
 # =========================
 # COST CONTROL
 # =========================
-cost_usage = {}
 DAILY_LIMIT = 0.03
+cost_map = {}
 
 def today():
     return str(date.today())
 
-def can_ai():
-    return cost_usage.get(today(), 0) < DAILY_LIMIT
+def get_cost():
+    return cost_map.get(today(), 0)
 
-def add_cost(v=0.001):
-    cost_usage[today()] = cost_usage.get(today(), 0) + v
+def add_cost(c=0.001):
+    cost_map[today()] = get_cost() + c
+
+def can_use_ai():
+    if get_cost() >= DAILY_LIMIT:
+        return False
+    return True
 
 # =========================
-# SHEET INIT
+# TRACE SYSTEM
+# =========================
+def trace_id():
+    return "T" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+# =========================
+# GOOGLE SHEET
 # =========================
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -62,232 +74,188 @@ def ws(name, cols):
     return w
 
 user_ws = ws("user", ["user_id","name","phone","address","time"])
-product_ws = ws("product", ["product_id","product","price","time"])
-order_ws = ws("order", ["order_id","user","product","qty","status","time"])
-log_ws = ws("log", ["time","stage","type","message"])
+product_ws = ws("product", ["product_id","product","price","status","time"])
+order_ws = ws("order", ["order_id","user","product","qty","price","total","status","time"])
+log_ws = ws("log", ["time","trace","stage","type","msg","ai_diag","cost"])
 
 # =========================
 # LOG
 # =========================
-def log(stage, type_, msg):
+def log(tr, stage, type_, msg, diag="", cost=0):
     try:
         log_ws.append_row([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            tr,
             stage,
             type_,
-            str(msg)[:500]
+            str(msg)[:300],
+            diag,
+            cost
         ])
     except:
-        print("LOG FAIL:", msg)
+        print("LOG FAIL")
 
 # =========================
-# ID（6碼）
+# DUP PREVENT
 # =========================
-def next_id(ws, prefix):
-    try:
-        records = ws.get_all_records()
-        return f"{prefix}{str(len(records)+1).zfill(5)}"
-    except:
-        return f"{prefix}00001"
+seen = set()
 
-# =========================
-# 防重
-# =========================
-processed = set()
-
-def is_duplicate(eid):
-    if eid in processed:
+def dedupe(mid):
+    if mid in seen:
         return True
-    processed.add(eid)
+    seen.add(mid)
     return False
 
 # =========================
-# 查單
+# SHEET FIND SAFE
 # =========================
-def find_order(oid):
-    records = order_ws.get_all_records()
-    for idx, r in enumerate(records):
-        if r["order_id"] == oid:
-            return idx+2, r
+def find_order_row(order_id):
+    values = order_ws.get_all_values()
+    for i, row in enumerate(values):
+        if i == 0:
+            continue
+        if row[0] == order_id:
+            return i+1, row
     return None, None
+
+# =========================
+# PRICE
+# =========================
+def price(product):
+    rows = product_ws.get_all_records()
+    for r in rows:
+        if r["product"] == product:
+            return int(r.get("price",0))
+    return 0
+
+# =========================
+# MULTI ORDER PARSER
+# =========================
+def parse_order(text):
+    m = re.match(r"(.+?)買(.+)", text)
+    if not m:
+        return None
+
+    user = m.group(1)
+    items = re.findall(r"([\u4e00-\u9fa5A-Za-z]+)(\d+)", m.group(2))
+
+    if not items:
+        return None
+
+    return {
+        "action":"order_multi",
+        "user":user,
+        "items":[{"p":i[0],"q":int(i[1])} for i in items]
+    }
 
 # =========================
 # RULE PARSER
 # =========================
 def rule_parse(text):
 
-    # 查單
-    m = re.search(r"(查|看).*(d\d{5})", text)
-    if m:
-        return {"action":"query_order","order_id":m.group(2)}
+    r = parse_order(text)
+    if r:
+        return r
 
-    # 修改
     if "改" in text:
-        m = re.search(r"(d\d{5}).*(\d+)", text)
+        m = re.search(r"(d\d+).*(\d+)", text)
         if m:
-            return {
-                "action":"update_order",
-                "order_id": m.group(1),
-                "qty": int(m.group(2))
-            }
+            return {"action":"update","id":m.group(1),"qty":int(m.group(2))}
 
-    # 刪除
     if "刪" in text:
-        m = re.search(r"(d\d{5})", text)
+        m = re.search(r"(d\d+)", text)
         if m:
-            return {"action":"delete_order","order_id":m.group(1)}
+            return {"action":"delete","id":m.group(1)}
 
-    # 確認
     if "確認" in text:
-        m = re.search(r"(d\d{5})", text)
+        m = re.search(r"(d\d+)", text)
         if m:
-            return {"action":"confirm_order","order_id":m.group(1)}
-
-    # 訂單
-    m = re.search(r"(.*)買(.*?)(\d+)", text)
-    if m:
-        return {
-            "action":"order",
-            "name": m.group(1).strip(),
-            "product": m.group(2).strip(),
-            "qty": int(m.group(3))
-        }
-
-    # 產品
-    m = re.search(r"(.*)\s*(\d+)元", text)
-    if m:
-        return {
-            "action":"create_product",
-            "product": m.group(1).strip(),
-            "price": int(m.group(2))
-        }
-
-    # 會員
-    if "電話" in text or "住" in text:
-        phone = re.search(r"09\d{8}", text)
-        addr = text.split("住")[-1] if "住" in text else ""
-
-        return {
-            "action":"create_user",
-            "name": text.split()[0],
-            "phone": phone.group() if phone else "",
-            "address": addr
-        }
+            return {"action":"confirm","id":m.group(1)}
 
     return None
 
 # =========================
-# AI PARSER
+# AI FALLBACK
 # =========================
-def should_use_ai(text):
-    if len(text) < 6:
-        return True
-    if not any(k in text for k in ["買","元","電話","住","查","改","刪","確認"]):
-        return True
-    return False
+def ai_parse(text, tr):
 
-def ai_parse(text):
-    if not can_ai():
-        return None
+    if not can_use_ai():
+        return None, "AI_BLOCKED"
+
     try:
         res = openai.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"user","content":f"轉JSON：{text}"}],
+            messages=[{"role":"user","content":text}],
             temperature=0
         )
+
         add_cost()
 
-        match = re.search(r"\{.*\}", res.choices[0].message.content, re.S)
-        if match:
-            return json.loads(match.group())
-    except:
-        return None
+        content = res.choices[0].message.content
+        log(tr,"AI","CALL",text,"AI_OK",get_cost())
 
-# =========================
-# HANDLE
-# =========================
-def handle(data):
+        m = re.search(r"\{.*\}", content, re.S)
+        if m:
+            return json.loads(m.group()), "AI_OK"
 
-    action = data.get("action")
-
-    try:
-        # USER
-        if action == "create_user":
-            uid = next_id(user_ws,"u")
-            user_ws.append_row([
-                uid,
-                data.get("name"),
-                data.get("phone",""),
-                data.get("address",""),
-                datetime.now().strftime("%H:%M")
-            ])
-            return f"👤 會員建立成功：{uid}"
-
-        # PRODUCT
-        if action == "create_product":
-            pid = next_id(product_ws,"p")
-            product_ws.append_row([
-                pid,
-                data.get("product"),
-                data.get("price"),
-                datetime.now().strftime("%H:%M")
-            ])
-            return f"📦 產品建立成功：{pid}"
-
-        # ORDER
-        if action == "order":
-            oid = next_id(order_ws,"d")
-            order_ws.append_row([
-                oid,
-                data.get("name"),
-                data.get("product"),
-                data.get("qty",1),
-                "pending",
-                datetime.now().strftime("%H:%M")
-            ])
-            return f"🧾 訂單完成：{oid}"
-
-        # QUERY
-        if action == "query_order":
-            row, o = find_order(data.get("order_id"))
-            if not o:
-                return "❌ 找不到訂單"
-            return f"""📄 訂單
-編號:{o['order_id']}
-姓名:{o['user']}
-商品:{o['product']}
-數量:{o['qty']}
-狀態:{o['status']}"""
-
-        # UPDATE
-        if action == "update_order":
-            row, o = find_order(data.get("order_id"))
-            if not o:
-                return "❌ 找不到訂單"
-            order_ws.update_cell(row,4,data.get("qty"))
-            return f"✏️ 已更新 {o['order_id']} → {data.get('qty')}"
-
-        # DELETE
-        if action == "delete_order":
-            row, o = find_order(data.get("order_id"))
-            if not o:
-                return "❌ 找不到訂單"
-            order_ws.delete_rows(row)
-            return f"🗑️ 已刪除 {o['order_id']}"
-
-        # CONFIRM
-        if action == "confirm_order":
-            row, o = find_order(data.get("order_id"))
-            if not o:
-                return "❌ 找不到訂單"
-            order_ws.update_cell(row,5,"confirmed")
-            return f"✅ 已確認 {o['order_id']}"
-
-        return "⚠️ 無法識別"
+        return None, "AI_PARSE_FAIL"
 
     except Exception as e:
-        log("HANDLE","FAIL",str(e))
-        return "❌ 系統錯誤"
+        return None, f"AI_ERROR:{str(e)}"
+
+# =========================
+# HANDLE ENGINE
+# =========================
+def handle(data, tr):
+
+    if not data:
+        return "⚠️ 無法識別"
+
+    try:
+
+        if data["action"] == "order_multi":
+
+            oid = "d" + uuid.uuid4().hex[:6]
+            total = 0
+
+            for i in data["items"]:
+                p = price(i["p"])
+                t = p * i["q"]
+                total += t
+
+                order_ws.append_row([
+                    oid,
+                    data["user"],
+                    i["p"],
+                    i["q"],
+                    p,
+                    t,
+                    "pending",
+                    datetime.now().strftime("%H:%M")
+                ])
+
+            return f"🧾 OK {oid}"
+
+        if data["action"] == "update":
+            row,_ = find_order_row(data["id"])
+            order_ws.update_cell(row,4,data["qty"])
+            return f"✏️ OK {data['id']}"
+
+        if data["action"] == "delete":
+            row,_ = find_order_row(data["id"])
+            order_ws.delete_rows(row)
+            return f"🗑️ OK {data['id']}"
+
+        if data["action"] == "confirm":
+            row,_ = find_order_row(data["id"])
+            order_ws.update_cell(row,7,"confirmed")
+            return f"✅ OK {data['id']}"
+
+        return "⚠️ unknown"
+
+    except Exception as e:
+        log(tr,"ERROR","HANDLE",str(e))
+        return f"❌ ERROR"
 
 # =========================
 # WEBHOOK
@@ -303,29 +271,38 @@ def callback():
         if e["type"] != "message":
             continue
 
-        eid = e["message"]["id"]
-        if is_duplicate(eid):
+        mid = e["message"]["id"]
+        if dedupe(mid):
             return "OK"
 
+        tr = trace_id()
         text = e["message"]["text"]
-        log("WEBHOOK","RECEIVED",text)
+
+        log(tr,"WEBHOOK","RECV",text)
 
         data = rule_parse(text)
+        diag = "RULE"
 
-        if not data or should_use_ai(text):
-            ai_data = ai_parse(text)
-            if ai_data:
-                data = ai_data
+        if not data:
+            data, diag = ai_parse(text, tr)
 
-        result = handle(data) if data else "⚠️ 無法理解"
+            if diag == "AI_BLOCKED":
+                result = "⚠️ AI額度已用完"
+                log(tr,"AI","BLOCK",text,diag,get_cost())
+            else:
+                result = handle(data, tr)
+        else:
+            result = handle(data, tr)
+
+        log(tr,"RESULT","DONE",result,diag,get_cost())
 
         try:
             line_bot_api.reply_message(
                 e["replyToken"],
                 TextSendMessage(text=result)
             )
-        except Exception as err:
-            log("LINE","FAIL",str(err))
+        except Exception as ex:
+            log(tr,"LINE","FAIL",str(ex))
 
     return "OK"
 
@@ -334,10 +311,11 @@ def callback():
 def health():
     return jsonify({
         "status":"ok",
-        "version":"v20",
-        "cost": cost_usage.get(today(),0)
+        "version":"v20.2",
+        "cost":get_cost(),
+        "limit":DAILY_LIMIT
     })
 
 @app.route("/")
 def home():
-    return "v20 running"
+    return "v20.2 running"
