@@ -47,7 +47,12 @@ def trace_id():
     return "T" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
 # =========================
-# GOOGLE SHEET
+# DEDUP (重點修復)
+# =========================
+processed_messages = set()
+
+# =========================
+# SHEET
 # =========================
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -76,7 +81,7 @@ order_ws = ws("order", ["order_id","user","product","qty","price","total","statu
 log_ws = ws("log", ["time","trace","stage","type","msg","ai_diag","cost"])
 
 # =========================
-# LOG SYSTEM
+# LOG
 # =========================
 def log(tr, stage, type_, msg, diag="", cost=0):
     try:
@@ -93,20 +98,18 @@ def log(tr, stage, type_, msg, diag="", cost=0):
         print("LOG FAIL")
 
 # =========================
-# JSON SAFE PARSER
+# JSON PARSER
 # =========================
 def extract_json(text):
     try:
         s = text.find("{")
         e = text.rfind("}") + 1
-        if s == -1 or e == -1:
-            return None
         return json.loads(text[s:e])
     except:
         return None
 
 # =========================
-# RULE PARSER (cheap first)
+# RULE PARSER
 # =========================
 def rule_parse(text):
 
@@ -115,27 +118,28 @@ def rule_parse(text):
         if m:
             user = m.group(1)
             items = re.findall(r"([\u4e00-\u9fa5A-Za-z]+)(\d+)", m.group(2))
+
             return {
                 "action":"order_multi",
-                "user":user,
-                "items":[{"p":i[0],"q":int(i[1])} for i in items]
+                "data":{
+                    "user":user,
+                    "items":[{"product":i[0],"qty":int(i[1])} for i in items]
+                }
             }
-
-    if "改" in text:
-        m = re.search(r"(d\d+).*(\d+)", text)
-        if m:
-            return {"action":"update","id":m.group(1),"qty":int(m.group(2))}
-
-    if "刪" in text:
-        m = re.search(r"(d\d+)", text)
-        if m:
-            return {"action":"delete","id":m.group(1)}
 
     return None
 
 # =========================
-# AI PARSER (v20.4)
+# AI PARSE
 # =========================
+ALLOWED_ACTIONS = {
+    "create_user",
+    "create_product",
+    "order_multi",
+    "update",
+    "delete"
+}
+
 def ai_parse(text, tr):
 
     if not can_use_ai():
@@ -145,30 +149,24 @@ def ai_parse(text, tr):
         res = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {
-                    "role":"system",
-                    "content":"""
-你是企業級 LINE 商務解析 AI。
+                {"role":"system","content":"""
+你是企業級訂單解析器。
 
-你必須將自然語言轉成 JSON。
+只允許 action：
+create_user, create_product, order_multi, update, delete
 
-輸出格式：
+禁止任何其他 action。
+
+輸出 JSON：
 {
   "ok": true,
   "action": "",
   "data": {},
   "confidence": 0-1,
-  "error_type": "",
   "reason": "",
   "suggestion": ""
 }
-
-規則：
-- 不可輸出任何多餘文字
-- 不可 markdown
-- 無法理解時 ok=false 並解釋原因
-"""
-                },
+"""},
                 {"role":"user","content":text}
             ],
             temperature=0
@@ -180,82 +178,91 @@ def ai_parse(text, tr):
         log(tr,"AI","RAW",raw,"AI_OK",get_cost())
 
         data = extract_json(raw)
-
-        if not data:
-            return None, "AI_PARSE_FAIL"
-
         return data, "AI_OK"
 
     except Exception as e:
         return None, f"AI_ERROR:{str(e)}"
 
 # =========================
-# PRICE LOOKUP
+# HELPERS
 # =========================
-def price(product):
+def gen_id(prefix):
+    return prefix + uuid.uuid4().hex[:6]
+
+def get_price(p):
     rows = product_ws.get_all_records()
     for r in rows:
-        if r["product"] == product:
-            return int(r.get("price",0))
+        if r["product"] == p:
+            return int(r["price"])
     return 0
 
 # =========================
-# HANDLE ENGINE
+# HANDLE
 # =========================
 def handle(data, tr):
 
     if not data:
         return "⚠️ 無法識別"
 
-    try:
+    action = data.get("action")
+    d = data.get("data", {})
 
-        action = data.get("action")
+    # 🔴 AI 防火牆（關鍵）
+    if action not in ALLOWED_ACTIONS:
+        log(tr,"AI","BLOCK_ACTION",data,"INVALID_ACTION")
+        return "⚠️ 不支援的操作"
 
-        if action == "order_multi":
+    # CREATE PRODUCT
+    if action == "create_product":
+        pid = gen_id("p")
 
-            oid = "d" + uuid.uuid4().hex[:6]
-            user = data.get("user")
-            items = data.get("items", [])
+        product_ws.append_row([
+            pid,
+            d.get("product"),
+            d.get("price"),
+            "active",
+            datetime.now().strftime("%H:%M")
+        ])
 
-            total = 0
+        return f"📦 OK {pid}"
 
-            for i in items:
-                p = price(i["p"])
-                total += p * i["q"]
+    # CREATE USER
+    if action == "create_user":
+        uid = gen_id("u")
 
-                order_ws.append_row([
-                    oid,
-                    user,
-                    i["p"],
-                    i["q"],
-                    p,
-                    p*i["q"],
-                    "pending",
-                    datetime.now().strftime("%H:%M")
-                ])
+        user_ws.append_row([
+            uid,
+            d.get("name"),
+            d.get("phone"),
+            d.get("address"),
+            datetime.now().strftime("%H:%M")
+        ])
 
-            return f"🧾 OK {oid}"
+        return f"👤 OK {uid}"
 
-        if action == "update":
-            # naive update (safe version)
-            rows = order_ws.get_all_values()
-            for idx, r in enumerate(rows):
-                if r[0] == data["id"]:
-                    order_ws.update_cell(idx+1,4,data["qty"])
-                    return f"✏️ OK {data['id']}"
+    # ORDER
+    if action == "order_multi":
+        oid = gen_id("d")
+        total = 0
 
-        if action == "delete":
-            rows = order_ws.get_all_values()
-            for idx, r in enumerate(rows):
-                if r[0] == data["id"]:
-                    order_ws.delete_rows(idx+1)
-                    return f"🗑️ OK {data['id']}"
+        for i in d.get("items", []):
+            p = get_price(i["product"])
+            total += p * i["qty"]
 
-        return "⚠️ unknown"
+            order_ws.append_row([
+                oid,
+                d.get("user"),
+                i["product"],
+                i["qty"],
+                p,
+                p * i["qty"],
+                "pending",
+                datetime.now().strftime("%H:%M")
+            ])
 
-    except Exception as e:
-        log(tr,"ERROR","HANDLE",str(e))
-        return "❌ ERROR"
+        return f"🧾 OK {oid}"
+
+    return "⚠️ unknown"
 
 # =========================
 # WEBHOOK
@@ -271,28 +278,34 @@ def callback():
         if e["type"] != "message":
             continue
 
-        text = e["message"]["text"]
         mid = e["message"]["id"]
 
+        # 🔴 去重（防 LINE retry 爆炸）
+        if mid in processed_messages:
+            return "OK"
+
+        processed_messages.add(mid)
+
+        text = e["message"]["text"]
         tr = trace_id()
 
         log(tr,"WEBHOOK","RECV",text)
 
-        # RULE FIRST (省錢)
         data = rule_parse(text)
         diag = "RULE"
 
         if not data:
             data, diag = ai_parse(text, tr)
 
-            if diag == "AI_BLOCKED":
-                result = "⚠️ AI額度已用完"
-                log(tr,"AI","BLOCK",text,diag,get_cost())
-            elif data and data.get("ok") is False:
-                # AI explain error
-                result = f"⚠️ {data.get('reason','無法理解')}\n💡 {data.get('suggestion','請調整輸入')}"
+            if not data:
+                result = "⚠️ AI解析失敗"
+
+            elif data.get("ok") is False:
+                result = f"⚠️ {data.get('reason','')}\n💡 {data.get('suggestion','')}"
+
             else:
                 result = handle(data, tr)
+
         else:
             result = handle(data, tr)
 
@@ -313,11 +326,11 @@ def callback():
 def health():
     return jsonify({
         "status":"ok",
-        "version":"v20.4",
+        "version":"v20.4.2",
         "cost":get_cost(),
         "limit":DAILY_LIMIT
     })
 
 @app.route("/")
 def home():
-    return "v20.4 running"
+    return "v20.4.2 running"
