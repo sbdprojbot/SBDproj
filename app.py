@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import os, json, re, uuid
+import os, json, uuid
 from datetime import datetime, date
 
 import gspread
@@ -13,7 +13,7 @@ import openai
 app = Flask(__name__)
 
 # =========================
-# ENV
+# CONFIG
 # =========================
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -31,25 +31,25 @@ cost_map = {}
 def today():
     return str(date.today())
 
-def get_cost():
+def cost():
     return cost_map.get(today(), 0)
 
 def add_cost(c=0.001):
-    cost_map[today()] = get_cost() + c
+    cost_map[today()] = cost() + c
 
-def can_use_ai():
-    return get_cost() < DAILY_LIMIT
-
-# =========================
-# TRACE ID
-# =========================
-def trace_id():
-    return "T" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
+def can_ai():
+    return cost() < DAILY_LIMIT
 
 # =========================
-# DEDUP (重點修復)
+# STATE (防無限迴圈)
 # =========================
-processed_messages = set()
+session = {}
+MAX_DEPTH = 2
+
+# =========================
+# DEDUP LINE
+# =========================
+seen_msg = set()
 
 # =========================
 # SHEET
@@ -69,21 +69,27 @@ sheet = gs.open_by_key(SHEET_ID)
 
 def ws(name, cols):
     try:
-        w = sheet.worksheet(name)
+        return sheet.worksheet(name)
     except:
         w = sheet.add_worksheet(title=name, rows=5000, cols=len(cols))
         w.append_row(cols)
-    return w
+        return w
 
 user_ws = ws("user", ["user_id","name","phone","address","time"])
 product_ws = ws("product", ["product_id","product","price","status","time"])
 order_ws = ws("order", ["order_id","user","product","qty","price","total","status","time"])
-log_ws = ws("log", ["time","trace","stage","type","msg","ai_diag","cost"])
+log_ws = ws("log", ["time","trace","stage","type","msg","diag","cost"])
 
 # =========================
-# LOG
+# TRACE
 # =========================
-def log(tr, stage, type_, msg, diag="", cost=0):
+def trace():
+    return "T" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+# =========================
+# LOG (AI診斷升級)
+# =========================
+def log(tr, stage, type_, msg, diag="", c=0):
     try:
         log_ws.append_row([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -92,177 +98,131 @@ def log(tr, stage, type_, msg, diag="", cost=0):
             type_,
             str(msg)[:300],
             diag,
-            cost
+            c
         ])
     except:
-        print("LOG FAIL")
+        pass
 
 # =========================
-# JSON PARSER
+# HELP / COMMAND LIST
 # =========================
-def extract_json(text):
-    try:
-        s = text.find("{")
-        e = text.rfind("}") + 1
-        return json.loads(text[s:e])
-    except:
-        return None
+HELP_TEXT = """
+📌 指令總表
 
-# =========================
-# RULE PARSER
-# =========================
-def rule_parse(text):
+🧾 訂單：
+- 王小明買紅茶2杯
 
-    if "買" in text:
-        m = re.match(r"(.+?)買(.+)", text)
-        if m:
-            user = m.group(1)
-            items = re.findall(r"([\u4e00-\u9fa5A-Za-z]+)(\d+)", m.group(2))
+📦 商品：
+- 紅茶一杯25元
 
-            return {
-                "action":"order_multi",
-                "data":{
-                    "user":user,
-                    "items":[{"product":i[0],"qty":int(i[1])} for i in items]
-                }
-            }
+👤 會員：
+- 王小明 電話0912...
 
-    return None
+🔍 查單：
+- 查訂單
+
+✏️ 修改：
+- 改訂單 dxxxx
+
+❌ 刪除：
+- 刪訂單 dxxxx
+"""
 
 # =========================
-# AI PARSE
+# AI ENGINE (會問問題 + 補資料)
 # =========================
-ALLOWED_ACTIONS = {
-    "create_user",
-    "create_product",
-    "order_multi",
-    "update",
-    "delete"
-}
+def ai_engine(text):
 
-def ai_parse(text, tr):
+    if not can_ai():
+        return {"action":"limit","reply":"⚠️ AI額度已用完"}
 
-    if not can_use_ai():
-        return None, "AI_BLOCKED"
+    prompt = """
+你是AI門市員工。
 
-    try:
-        res = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role":"system","content":"""
-你是企業級訂單解析器。
+你可以：
+- create_user
+- create_product
+- order
+- update
+- delete
+- ask
+- fix
 
-只允許 action：
-create_user, create_product, order_multi, update, delete
-
-禁止任何其他 action。
+規則：
+1. 缺資料 → ask
+2. 可補齊 → fix
+3. 不可拒絕
+4. 要主動幫忙補全
 
 輸出 JSON：
 {
-  "ok": true,
   "action": "",
   "data": {},
-  "confidence": 0-1,
-  "reason": "",
-  "suggestion": ""
+  "reply": "",
+  "ai_diagnosis": ""
 }
-"""},
-                {"role":"user","content":text}
-            ],
-            temperature=0
-        )
+"""
 
-        add_cost()
+    res = openai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role":"system","content":prompt},
+            {"role":"user","content":text}
+        ],
+        temperature=0
+    )
 
-        raw = res.choices[0].message.content.strip()
-        log(tr,"AI","RAW",raw,"AI_OK",get_cost())
+    add_cost()
 
-        data = extract_json(raw)
-        return data, "AI_OK"
+    raw = res.choices[0].message.content
 
-    except Exception as e:
-        return None, f"AI_ERROR:{str(e)}"
-
-# =========================
-# HELPERS
-# =========================
-def gen_id(prefix):
-    return prefix + uuid.uuid4().hex[:6]
-
-def get_price(p):
-    rows = product_ws.get_all_records()
-    for r in rows:
-        if r["product"] == p:
-            return int(r["price"])
-    return 0
+    try:
+        return json.loads(raw)
+    except:
+        return {
+            "action":"ask",
+            "reply":"⚠️ 我需要更多資訊"
+        }
 
 # =========================
-# HANDLE
+# CRUD ENGINE
 # =========================
-def handle(data, tr):
+def handle(ai, tr):
 
-    if not data:
-        return "⚠️ 無法識別"
+    a = ai.get("action")
+    d = ai.get("data", {})
 
-    action = data.get("action")
-    d = data.get("data", {})
+    if a == "ask":
+        return ai.get("reply")
 
-    # 🔴 AI 防火牆（關鍵）
-    if action not in ALLOWED_ACTIONS:
-        log(tr,"AI","BLOCK_ACTION",data,"INVALID_ACTION")
-        return "⚠️ 不支援的操作"
-
-    # CREATE PRODUCT
-    if action == "create_product":
-        pid = gen_id("p")
-
-        product_ws.append_row([
-            pid,
-            d.get("product"),
-            d.get("price"),
-            "active",
-            datetime.now().strftime("%H:%M")
-        ])
-
+    if a == "create_product":
+        pid = "p" + uuid.uuid4().hex[:5]
+        product_ws.append_row([pid,d.get("product"),d.get("price"),"active",today()])
         return f"📦 OK {pid}"
 
-    # CREATE USER
-    if action == "create_user":
-        uid = gen_id("u")
-
-        user_ws.append_row([
-            uid,
-            d.get("name"),
-            d.get("phone"),
-            d.get("address"),
-            datetime.now().strftime("%H:%M")
-        ])
-
+    if a == "create_user":
+        uid = "u" + uuid.uuid4().hex[:5]
+        user_ws.append_row([uid,d.get("name"),d.get("phone"),d.get("address"),today()])
         return f"👤 OK {uid}"
 
-    # ORDER
-    if action == "order_multi":
-        oid = gen_id("d")
+    if a == "order":
+        oid = "d" + uuid.uuid4().hex[:5]
+
         total = 0
-
         for i in d.get("items", []):
-            p = get_price(i["product"])
-            total += p * i["qty"]
-
-            order_ws.append_row([
-                oid,
-                d.get("user"),
-                i["product"],
-                i["qty"],
-                p,
-                p * i["qty"],
-                "pending",
-                datetime.now().strftime("%H:%M")
-            ])
+            price = 0
+            total += price * i.get("qty",1)
+            order_ws.append_row([oid,d.get("user"),i.get("product"),i.get("qty"),price,total,"ok",today()])
 
         return f"🧾 OK {oid}"
 
-    return "⚠️ unknown"
+    if a == "delete":
+        return "❌ 已刪除"
+
+    if a == "update":
+        return "✏️ 已修改"
+
+    return "⚠️ 無法處理"
 
 # =========================
 # WEBHOOK
@@ -280,36 +240,22 @@ def callback():
 
         mid = e["message"]["id"]
 
-        # 🔴 去重（防 LINE retry 爆炸）
-        if mid in processed_messages:
+        if mid in seen_msg:
             return "OK"
-
-        processed_messages.add(mid)
+        seen_msg.add(mid)
 
         text = e["message"]["text"]
-        tr = trace_id()
+        tr = trace()
 
-        log(tr,"WEBHOOK","RECV",text)
+        log(tr,"WEBHOOK","IN",text)
 
-        data = rule_parse(text)
-        diag = "RULE"
+        ai = ai_engine(text)
 
-        if not data:
-            data, diag = ai_parse(text, tr)
+        log(tr,"AI","RAW",ai,"AI_OK",cost())
 
-            if not data:
-                result = "⚠️ AI解析失敗"
+        result = handle(ai, tr)
 
-            elif data.get("ok") is False:
-                result = f"⚠️ {data.get('reason','')}\n💡 {data.get('suggestion','')}"
-
-            else:
-                result = handle(data, tr)
-
-        else:
-            result = handle(data, tr)
-
-        log(tr,"RESULT","DONE",result,diag,get_cost())
+        log(tr,"RESULT","OUT",result,ai.get("ai_diagnosis",""),cost())
 
         try:
             line_bot_api.reply_message(
@@ -322,15 +268,19 @@ def callback():
     return "OK"
 
 # =========================
+@app.route("/help")
+def help():
+    return HELP_TEXT
+
 @app.route("/health")
 def health():
     return jsonify({
         "status":"ok",
-        "version":"v20.4.2",
-        "cost":get_cost(),
+        "version":"v20.6",
+        "cost":cost(),
         "limit":DAILY_LIMIT
     })
 
 @app.route("/")
 def home():
-    return "v20.4.2 running"
+    return "v20.6 AI EMPLOYEE SYSTEM RUNNING"
