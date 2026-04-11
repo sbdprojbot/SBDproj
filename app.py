@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import os, json, re, threading, time
+import os, json, re, threading, time, uuid
 from datetime import datetime
 from queue import Queue
 
@@ -27,9 +27,11 @@ openai.api_key = OPENAI_API_KEY
 line_bot_api = LineBotApi(LINE_TOKEN)
 
 # =========================
-# CORE STATE
+# STATE
 # =========================
 task_queue = Queue()
+trace_store = {}
+
 ai_calls = 0
 ai_cache = {}
 
@@ -49,44 +51,53 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(
 gs = gspread.authorize(creds)
 sheet = gs.open_by_key(SHEET_ID)
 
-# =========================
-# SHEETS SAFE INIT
-# =========================
-def get_ws(name, cols):
+def ws(name, cols):
     try:
-        ws = sheet.worksheet(name)
+        w = sheet.worksheet(name)
     except:
-        ws = sheet.add_worksheet(title=name, rows=2000, cols=len(cols))
-        ws.append_row(cols)
-    return ws
+        w = sheet.add_worksheet(title=name, rows=2000, cols=len(cols))
+        w.append_row(cols)
+    return w
 
-order_ws = get_ws("order", ["order_id","time","user_id","name","product","qty","status"])
-log_ws = get_ws("log", ["time","type","message"])
+order_ws = ws("order", ["trace_id","order_id","time","user_id","name","product","qty","status"])
+log_ws = ws("log", ["time","trace_id","stage","type","message"])
 
 # =========================
-# LOGGING
+# TRACE LOG
 # =========================
-def log(type_, msg):
+def log(trace_id, stage, type_, msg):
+    entry = {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "trace_id": trace_id,
+        "stage": stage,
+        "type": type_,
+        "msg": str(msg)[:500]
+    }
+
+    trace_store.setdefault(trace_id, []).append(entry)
+
     try:
         log_ws.append_row([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            entry["time"],
+            trace_id,
+            stage,
             type_,
-            str(msg)[:500]
+            entry["msg"]
         ])
     except:
-        print("LOG FAIL:", msg)
+        print("LOG FAIL", entry)
 
 # =========================
-# LINE REPLY
+# REPLY
 # =========================
 def reply(token, msg):
     try:
         line_bot_api.reply_message(token, TextSendMessage(text=msg))
     except Exception as e:
-        log("LINE_REPLY_FAIL", e)
+        print("REPLY FAIL", e)
 
 # =========================
-# SIMPLE PARSER
+# PARSER
 # =========================
 def parse(text):
     try:
@@ -100,12 +111,11 @@ def parse(text):
                 }]
             }
         return None
-    except Exception as e:
-        log("PARSE_FAIL", e)
+    except:
         return None
 
 # =========================
-# AI PARSER (LIMITED)
+# AI PARSER
 # =========================
 def ai_parse(text):
     global ai_calls
@@ -121,14 +131,8 @@ def ai_parse(text):
             model="gpt-4o-mini",
             messages=[{
                 "role": "user",
-                "content": f"""
-Return JSON only:
-{text}
-format:
-{{"name":"","items":[{{"product":"","qty":1}}]}}
-"""
-            }],
-            temperature=0
+                "content": f"JSON only:\n{text}"
+            }]
         )
 
         ai_calls += 1
@@ -140,19 +144,21 @@ format:
         ai_cache[text] = data
         return data
 
-    except Exception as e:
-        log("AI_PARSE_FAIL", e)
+    except:
         return None
 
 # =========================
-# WRITE ORDER (SAFE)
+# WRITE ORDER
 # =========================
-def write_order(data, user_id):
+def write_order(trace_id, data, user_id):
     try:
         oid = "D" + datetime.now().strftime("%Y%m%d%H%M%S")
 
+        log(trace_id, "SHEET", "WRITE_START", oid)
+
         for item in data["items"]:
-            order_ws.append_row([
+            row = [
+                trace_id,
                 oid,
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 user_id,
@@ -160,51 +166,60 @@ def write_order(data, user_id):
                 item["product"],
                 item["qty"],
                 "confirmed"
-            ])
+            ]
 
-        log("ORDER_WRITE", oid)
+            order_ws.append_row(row)
+
+        log(trace_id, "SHEET", "WRITE_OK", oid)
 
     except Exception as e:
-        log("SHEET_WRITE_FAIL", e)
+        log(trace_id, "SHEET", "WRITE_FAIL", e)
 
 # =========================
-# WORKER (CRITICAL FIX)
+# WORKER
 # =========================
 def worker():
-    log("WORKER", "STARTED")
+    print("🔥 WORKER STARTED")
 
     while True:
-        try:
-            task = task_queue.get()
+        task = task_queue.get()
 
-            log("QUEUE", task)
+        trace_id = task["trace_id"]
+
+        try:
+            log(trace_id, "QUEUE", "RECEIVED", task)
 
             text = task["text"]
             user_id = task["user_id"]
 
+            log(trace_id, "PARSER", "START", text)
+
             data = parse(text)
-            if not data:
+
+            if data:
+                log(trace_id, "PARSER", "OK", data)
+            else:
+                log(trace_id, "PARSER", "FALLBACK_AI", text)
                 data = ai_parse(text)
 
             if data:
-                write_order(data, user_id)
+                write_order(trace_id, data, user_id)
             else:
-                log("PARSE_EMPTY", text)
+                log(trace_id, "ERROR", "PARSE_EMPTY", text)
 
         except Exception as e:
-            log("WORKER_FAIL", e)
+            log(trace_id, "WORKER", "CRASH", e)
 
         finally:
             task_queue.task_done()
 
 # =========================
-# START WORKER (FOR RENDER SAFE)
+# START WORKER
 # =========================
 def start_worker():
     t = threading.Thread(target=worker)
     t.daemon = False
     t.start()
-    log("SYSTEM", "WORKER BOOTED")
 
 start_worker()
 
@@ -218,23 +233,30 @@ def callback():
     events = body.get("events", [])
 
     for e in events:
-        try:
-            if e["type"] != "message":
-                continue
 
-            reply(e["replyToken"], "✅ 已收到，處理中")
+        if e["type"] != "message":
+            continue
 
-            task_queue.put({
-                "text": e["message"]["text"],
-                "user_id": e["source"]["userId"]
-            })
+        trace_id = "T" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + str(uuid.uuid4())[:6]
 
-            log("WEBHOOK", e["message"]["text"])
+        log(trace_id, "WEBHOOK", "RECEIVED", e["message"]["text"])
 
-        except Exception as ex:
-            log("WEBHOOK_FAIL", ex)
+        reply(e["replyToken"], "✅ 已收到，處理中")
+
+        task_queue.put({
+            "trace_id": trace_id,
+            "text": e["message"]["text"],
+            "user_id": e["source"]["userId"]
+        })
 
     return "OK"
+
+# =========================
+# DEBUG VIEW
+# =========================
+@app.route("/debug/<trace_id>")
+def debug(trace_id):
+    return jsonify(trace_store.get(trace_id, []))
 
 # =========================
 # HEALTH
@@ -244,8 +266,7 @@ def health():
     return jsonify({
         "status": "ok",
         "queue": task_queue.qsize(),
-        "ai_calls": ai_calls,
-        "cache": len(ai_cache)
+        "ai_calls": ai_calls
     })
 
 # =========================
@@ -253,7 +274,7 @@ def health():
 # =========================
 @app.route("/")
 def home():
-    return "LINE BOT OK"
+    return "v17.6 debug console running"
 
 # =========================
 # RUN
