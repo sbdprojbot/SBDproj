@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 from datetime import datetime
+
 from flask import Flask, request
 
 from linebot import LineBotApi
@@ -11,29 +12,17 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # ==================================================
-# APP INIT
+# APP
 # ==================================================
 
 app = Flask(__name__)
 
 # ==================================================
-# ENV SAFE LOAD
+# ENV
 # ==================================================
 
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "")
-
-# ==================================================
-# LINE INIT (SAFE)
-# ==================================================
-
-line_bot_api = None
-
-if LINE_TOKEN:
-    try:
-        line_bot_api = LineBotApi(LINE_TOKEN)
-    except Exception as e:
-        print("[LINE_INIT_ERROR]", e)
 
 # ==================================================
 # LOG SYSTEM
@@ -42,12 +31,11 @@ if LINE_TOKEN:
 EVENT_LOG = []
 REPLAY_BUFFER = []
 
-def log_event(stage, message):
-
+def log(stage, msg):
     EVENT_LOG.append({
         "time": datetime.utcnow().isoformat(),
         "stage": stage,
-        "message": str(message)
+        "message": str(msg)
     })
 
     REPLAY_BUFFER.append(EVENT_LOG[-1])
@@ -59,18 +47,31 @@ def log_event(stage, message):
         REPLAY_BUFFER.pop(0)
 
 # ==================================================
-# SHEET INIT (SAFE NO CRASH)
+# LINE INIT
+# ==================================================
+
+line_bot_api = None
+
+try:
+    if LINE_TOKEN:
+        line_bot_api = LineBotApi(LINE_TOKEN)
+except Exception as e:
+    log("LINE_INIT_FAIL", e)
+
+# ==================================================
+# SHEET INIT
 # ==================================================
 
 client = None
 order_sheet = None
+sheet_fail_count = 0
 
 def init_sheet():
 
-    global client, order_sheet
+    global client, order_sheet, sheet_fail_count
 
     if not GOOGLE_CREDENTIALS:
-        log_event("SHEET_INIT_FAIL", "missing credentials")
+        log("SHEET_INIT_FAIL", "missing credentials")
         return
 
     try:
@@ -84,20 +85,16 @@ def init_sheet():
 
         client = gspread.authorize(creds)
 
-        try:
-            sheet = client.open("pos")
-        except Exception as e:
-            log_event("SHEET_OPEN_FAIL", e)
-            return
+        sheet = client.open("pos")
+        order_sheet = sheet.worksheet("Order")
 
-        try:
-            order_sheet = sheet.worksheet("Order")
-        except Exception as e:
-            log_event("WORKSHEET_FAIL", e)
-            order_sheet = None
+        sheet_fail_count = 0
+        log("SHEET_INIT_OK", "connected")
 
     except Exception as e:
-        log_event("SHEET_FATAL", e)
+        sheet_fail_count += 1
+        log("SHEET_INIT_FAIL", e)
+        order_sheet = None
 
 
 init_sheet()
@@ -106,10 +103,10 @@ init_sheet()
 # SAFE LINE REPLY
 # ==================================================
 
-def safe_reply(token, msg):
+def reply(token, msg):
 
     if not line_bot_api:
-        log_event("LINE_DISABLED", msg)
+        log("LINE_DISABLED", msg)
         return
 
     try:
@@ -118,10 +115,10 @@ def safe_reply(token, msg):
             TextSendMessage(text=msg)
         )
     except Exception as e:
-        log_event("LINE_FAIL", e)
+        log("LINE_REPLY_FAIL", e)
 
 # ==================================================
-# NLP PARSER (RULE BASED)
+# NLP PARSER
 # ==================================================
 
 def parse(text):
@@ -159,8 +156,8 @@ def process_order(user_id, text):
     items = parse(text)
 
     if not order_sheet:
-        log_event("ORDER_FAIL", "sheet offline")
-        return "⚠ 系統暫時離線（Sheet unavailable）"
+        log("ORDER_FAIL", "sheet offline")
+        return "⚠ 系統忙碌，訂單已暫存失敗"
 
     order_id = str(uuid.uuid4())
     total = 0
@@ -186,12 +183,12 @@ def process_order(user_id, text):
                 "OK"
             ])
         except Exception as e:
-            log_event("SHEET_WRITE_FAIL", e)
+            log("SHEET_WRITE_FAIL", e)
 
     return f"✔ 訂單成立 {order_id} / {total}"
 
 # ==================================================
-# OPS ENGINE
+# INCIDENT / OPS
 # ==================================================
 
 def replay():
@@ -203,28 +200,20 @@ def replay():
 
 def incident_report():
 
-    return f"""
-🧠 INCIDENT REPORT
--------------------
-total logs: {len(EVENT_LOG)}
+    return "\n".join([
+        f"{e['time']} | {e['stage']} | {e['message']}"
+        for e in EVENT_LOG[-20:]
+    ])
 
-LATEST:
-{replay()}
-"""
+def heal():
 
-def ops(text):
-
-    if text == "/report":
-        return incident_report()
-
-    if text == "/incident":
-        return replay()
-
-    if text == "/heal":
+    # bounded self-healing (NO LOOP)
+    try:
         init_sheet()
-        return "🧠 heal triggered (re-init sheet)"
-
-    return None
+        return "🧠 heal executed (single attempt)"
+    except Exception as e:
+        log("HEAL_FAIL", e)
+        return "⚠ heal failed"
 
 # ==================================================
 # WEBHOOK
@@ -241,27 +230,38 @@ def callback():
 
         for event in body.get("events", []):
 
+            # filter non-text
             if event.get("type") != "message":
+                continue
+
+            if event["message"].get("type") != "text":
                 continue
 
             text = event["message"].get("text", "")
             user_id = event["source"].get("userId", "")
-            reply_token = event.get("replyToken")
+            token = event.get("replyToken")
 
-            log_event("INPUT", text)
+            log("INPUT", text)
 
-            ops_result = ops(text)
+            # OPS COMMANDS
+            if text == "/report":
+                reply(token, incident_report())
+                continue
 
-            if ops_result:
-                safe_reply(reply_token, ops_result)
-                return "OK"
+            if text == "/incident":
+                reply(token, replay())
+                continue
 
+            if text == "/heal":
+                reply(token, heal())
+                continue
+
+            # ORDER FLOW
             result = process_order(user_id, text)
-
-            safe_reply(reply_token, result)
+            reply(token, result)
 
     except Exception as e:
-        log_event("FATAL", e)
+        log("WEBHOOK_FAIL", e)
 
     return "OK"
 
@@ -274,16 +274,14 @@ def health():
     return "OK"
 
 # ==================================================
-# STARTUP SAFE
+# STARTUP LOG
 # ==================================================
 
-@app.before_first_request
-def startup():
-    log_event("STARTUP", "system booted")
+log("STARTUP", "system booted")
 
 # ==================================================
 # RUN
 # ==================================================
 
 if __name__ == "__main__":
-    app.run(debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False)
