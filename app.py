@@ -2,8 +2,6 @@ import os
 import json
 import uuid
 from datetime import datetime
-from collections import defaultdict
-
 from flask import Flask, request
 
 from linebot import LineBotApi
@@ -12,89 +10,70 @@ from linebot.models import TextSendMessage
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# =========================================================
+# ==================================================
 # APP INIT
-# =========================================================
+# ==================================================
 
 app = Flask(__name__)
+
+# ==================================================
+# ENV SAFE LOAD
+# ==================================================
 
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "")
 
-line_bot_api = LineBotApi(LINE_TOKEN)
+# ==================================================
+# LINE INIT (SAFE)
+# ==================================================
 
-# =========================================================
-# INCIDENT STORE
-# =========================================================
+line_bot_api = None
+
+if LINE_TOKEN:
+    try:
+        line_bot_api = LineBotApi(LINE_TOKEN)
+    except Exception as e:
+        print("[LINE_INIT_ERROR]", e)
+
+# ==================================================
+# LOG SYSTEM
+# ==================================================
 
 EVENT_LOG = []
 REPLAY_BUFFER = []
 
-# =========================================================
-# SYSTEM STATE
-# =========================================================
+def log_event(stage, message):
 
-STATE = {
-    "line": True,
-    "sheet": True,
-    "mode": "normal"
-}
-
-# =========================================================
-# LOGGING
-# =========================================================
-
-def log_event(stage, message, meta=None):
-
-    event = {
+    EVENT_LOG.append({
         "time": datetime.utcnow().isoformat(),
         "stage": stage,
-        "message": str(message),
-        "meta": meta or {}
-    }
+        "message": str(message)
+    })
 
-    EVENT_LOG.append(event)
-    REPLAY_BUFFER.append(event)
+    REPLAY_BUFFER.append(EVENT_LOG[-1])
 
-    if len(EVENT_LOG) > 100:
+    if len(EVENT_LOG) > 300:
         EVENT_LOG.pop(0)
 
-    if len(REPLAY_BUFFER) > 200:
+    if len(REPLAY_BUFFER) > 50:
         REPLAY_BUFFER.pop(0)
 
-# =========================================================
-# SHEET AUTO RESOLVER
-# =========================================================
+# ==================================================
+# SHEET INIT (SAFE NO CRASH)
+# ==================================================
 
 client = None
 order_sheet = None
 
-def auto_resolve_sheet(client, keyword="pos"):
+def init_sheet():
+
+    global client, order_sheet
+
+    if not GOOGLE_CREDENTIALS:
+        log_event("SHEET_INIT_FAIL", "missing credentials")
+        return
 
     try:
-        files = client.list_spreadsheet_files()
-
-        for f in files:
-            name = f["name"].lower()
-            if keyword in name:
-                return client.open(f["name"])
-
-        if files:
-            return client.open(files[0]["name"])
-
-        return None
-
-    except Exception as e:
-        log_event("SHEET_RESOLVE_FAIL", e)
-        return None
-
-# =========================================================
-# INIT SHEET
-# =========================================================
-
-try:
-    if GOOGLE_CREDENTIALS:
-
         creds = ServiceAccountCredentials.from_json_keyfile_dict(
             json.loads(GOOGLE_CREDENTIALS),
             [
@@ -104,33 +83,46 @@ try:
         )
 
         client = gspread.authorize(creds)
-        sheet = auto_resolve_sheet(client, "pos")
 
-        if sheet:
+        try:
+            sheet = client.open("pos")
+        except Exception as e:
+            log_event("SHEET_OPEN_FAIL", e)
+            return
+
+        try:
             order_sheet = sheet.worksheet("Order")
+        except Exception as e:
+            log_event("WORKSHEET_FAIL", e)
+            order_sheet = None
 
-except Exception as e:
-    log_event("SHEET_INIT_ERROR", e)
+    except Exception as e:
+        log_event("SHEET_FATAL", e)
 
-# =========================================================
+
+init_sheet()
+
+# ==================================================
 # SAFE LINE REPLY
-# =========================================================
+# ==================================================
 
 def safe_reply(token, msg):
+
+    if not line_bot_api:
+        log_event("LINE_DISABLED", msg)
+        return
 
     try:
         line_bot_api.reply_message(
             token,
             TextSendMessage(text=msg)
         )
-
     except Exception as e:
-        STATE["line"] = False
-        log_event("LINE_REPLY_FAILED", e)
+        log_event("LINE_FAIL", e)
 
-# =========================================================
-# NLP ENGINE (LIGHT)
-# =========================================================
+# ==================================================
+# NLP PARSER (RULE BASED)
+# ==================================================
 
 def parse(text):
 
@@ -141,6 +133,7 @@ def parse(text):
     for part in text.split("+"):
 
         qty = 1
+
         if "兩" in part or "2" in part:
             qty = 2
 
@@ -157,17 +150,17 @@ def parse(text):
 
     return items
 
-# =========================================================
+# ==================================================
 # ORDER ENGINE
-# =========================================================
+# ==================================================
 
 def process_order(user_id, text):
 
     items = parse(text)
 
     if not order_sheet:
-        log_event("SHEET_MISSING", "fallback mode")
-        return "⚠ 系統暫時離線（memory mode）"
+        log_event("ORDER_FAIL", "sheet offline")
+        return "⚠ 系統暫時離線（Sheet unavailable）"
 
     order_id = str(uuid.uuid4())
     total = 0
@@ -192,65 +185,32 @@ def process_order(user_id, text):
                 total,
                 "OK"
             ])
-
         except Exception as e:
-            log_event("SHEET_WRITE_FAILED", e)
+            log_event("SHEET_WRITE_FAIL", e)
 
     return f"✔ 訂單成立 {order_id} / {total}"
 
-# =========================================================
-# INCIDENT CLASSIFIER
-# =========================================================
-
-def classify(events):
-
-    clusters = defaultdict(list)
-
-    for e in events:
-
-        if "SHEET" in e["stage"]:
-            clusters["sheet"].append(e)
-
-        elif "LINE" in e["stage"]:
-            clusters["line"].append(e)
-
-        else:
-            clusters["system"].append(e)
-
-    return clusters
-
-# =========================================================
-# REPLAY ENGINE
-# =========================================================
+# ==================================================
+# OPS ENGINE
+# ==================================================
 
 def replay():
 
-    return [
-        f"[{e['time']}] {e['stage']} → {e['message']}"
+    return "\n".join([
+        f"{e['time']} | {e['stage']} | {e['message']}"
         for e in REPLAY_BUFFER[-10:]
-    ]
-
-# =========================================================
-# INCIDENT REPORTER
-# =========================================================
+    ])
 
 def incident_report():
 
-    clusters = classify(EVENT_LOG)
-
     return f"""
 🧠 INCIDENT REPORT
-━━━━━━━━━━━━━━
-📊 total events: {len(EVENT_LOG)}
-📦 sheet issues: {len(clusters['sheet'])}
-📡 line issues: {len(clusters['line'])}
+-------------------
+total logs: {len(EVENT_LOG)}
 
-🧾 last replay:
-""" + "\n".join(replay())
-
-# =========================================================
-# OPS COMMANDS
-# =========================================================
+LATEST:
+{replay()}
+"""
 
 def ops(text):
 
@@ -258,16 +218,17 @@ def ops(text):
         return incident_report()
 
     if text == "/incident":
-        return "\n".join(replay())
+        return replay()
 
     if text == "/heal":
-        return "🧠 bounded self-heal executed"
+        init_sheet()
+        return "🧠 heal triggered (re-init sheet)"
 
     return None
 
-# =========================================================
+# ==================================================
 # WEBHOOK
-# =========================================================
+# ==================================================
 
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -275,14 +236,17 @@ def callback():
     try:
         body = request.get_json()
 
+        if not body:
+            return "OK"
+
         for event in body.get("events", []):
 
-            if event["type"] != "message":
+            if event.get("type") != "message":
                 continue
 
-            text = event["message"]["text"]
-            user_id = event["source"]["userId"]
-            reply_token = event["replyToken"]
+            text = event["message"].get("text", "")
+            user_id = event["source"].get("userId", "")
+            reply_token = event.get("replyToken")
 
             log_event("INPUT", text)
 
@@ -301,17 +265,25 @@ def callback():
 
     return "OK"
 
-# =========================================================
-# HEALTH
-# =========================================================
+# ==================================================
+# HEALTH CHECK
+# ==================================================
 
 @app.route("/")
 def health():
     return "OK"
 
-# =========================================================
+# ==================================================
+# STARTUP SAFE
+# ==================================================
+
+@app.before_first_request
+def startup():
+    log_event("STARTUP", "system booted")
+
+# ==================================================
 # RUN
-# =========================================================
+# ==================================================
 
 if __name__ == "__main__":
-    app.run()
+    app.run(debug=False)
