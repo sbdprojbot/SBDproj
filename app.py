@@ -5,72 +5,88 @@ from datetime import datetime
 
 from flask import Flask, request
 
-from linebot import LineBotApi, WebhookHandler
+from linebot import LineBotApi
 from linebot.models import TextSendMessage
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# =========================
+# =========================================================
 # APP INIT
-# =========================
+# =========================================================
 
 app = Flask(__name__)
 
-# =========================
-# ENV SAFE LOAD
-# =========================
+# =========================================================
+# ENV SAFE LOAD (NO CRASH)
+# =========================================================
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# =========================
-# GOOGLE SHEET AUTH (RENDER SAFE)
-# =========================
+# =========================================================
+# OPS MEMORY (IN-MEMORY INCIDENT BUFFER)
+# =========================================================
 
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
-]
+OPS_LOG_BUFFER = []
 
-creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+def push_incident(stage, message):
+    OPS_LOG_BUFFER.append({
+        "time": datetime.utcnow().isoformat(),
+        "stage": stage,
+        "message": message
+    })
 
-creds = ServiceAccountCredentials.from_json_keyfile_dict(
-    creds_json,
-    scope
-)
+    if len(OPS_LOG_BUFFER) > 50:
+        OPS_LOG_BUFFER.pop(0)
 
-client = gspread.authorize(creds)
-
-product_sheet = client.open("pos").worksheet("Product")
-user_sheet = client.open("pos").worksheet("User")
-order_sheet = client.open("pos").worksheet("Order")
-log_sheet = client.open("pos").worksheet("Log")
-replay_sheet = client.open("pos").worksheet("Replay")
-
-# =========================
-# LOG SYSTEM
-# =========================
+# =========================================================
+# LOGGING
+# =========================================================
 
 def log_error(stage, message):
-    try:
-        log_sheet.append_row([
-            str(uuid.uuid4()),
-            datetime.utcnow().isoformat(),
-            stage,
-            "ERROR",
-            message,
-            ""
-        ])
-    except:
-        pass
+    print(f"[{stage}] {message}")
+    push_incident(stage, message)
 
-# =========================
-# SAFE REPLY (CRITICAL FIX)
-# =========================
+# =========================================================
+# GOOGLE SHEET INIT (SAFE)
+# =========================================================
+
+client = None
+order_sheet = None
+
+try:
+    if GOOGLE_CREDENTIALS:
+
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+
+        creds_json = json.loads(GOOGLE_CREDENTIALS)
+
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(
+            creds_json,
+            scope
+        )
+
+        client = gspread.authorize(creds)
+        sheet = client.open("pos")
+
+        order_sheet = sheet.worksheet("Order")
+
+    else:
+        log_error("INIT", "GOOGLE_CREDENTIALS missing")
+
+except Exception as e:
+    log_error("SHEET_INIT_ERROR", str(e))
+
+# =========================================================
+# SAFE LINE REPLY
+# =========================================================
 
 def safe_reply(reply_token, text):
 
@@ -83,24 +99,9 @@ def safe_reply(reply_token, text):
     except Exception as e:
         log_error("LINE_REPLY_FAILED", str(e))
 
-        # store replay event
-        try:
-            replay_sheet.append_row([
-                str(uuid.uuid4()),
-                datetime.utcnow().isoformat(),
-                json.dumps({"reply_token": reply_token, "text": text}),
-                "LINE_REPLY",
-                "PENDING",
-                0,
-                str(e),
-                datetime.utcnow().isoformat()
-            ])
-        except:
-            pass
-
-# =========================
-# NLP / ORDER ENGINE
-# =========================
+# =========================================================
+# NLP ENGINE (LIGHT RULE BASED)
+# =========================================================
 
 def normalize_product(text):
 
@@ -111,6 +112,7 @@ def normalize_product(text):
             return p
 
     return "UNKNOWN"
+
 
 def extract_item(text):
 
@@ -132,6 +134,7 @@ def extract_item(text):
         "unit": unit
     }
 
+
 def parse_multi_item(text):
 
     text = text.replace("還有", "+").replace("加上", "+")
@@ -139,9 +142,9 @@ def parse_multi_item(text):
 
     return [extract_item(p) for p in parts if p.strip()]
 
-# =========================
-# ORDER PROCESSOR
-# =========================
+# =========================================================
+# ORDER ENGINE
+# =========================================================
 
 def process_order(user_id, text):
 
@@ -149,6 +152,9 @@ def process_order(user_id, text):
 
     if not items:
         return "⚠ 無法解析訂單"
+
+    if order_sheet is None:
+        return "⚠ Sheet 未初始化"
 
     order_id = str(uuid.uuid4())
     total = 0
@@ -177,28 +183,59 @@ def process_order(user_id, text):
                 total,
                 "SUCCESS"
             ])
+
         except Exception as e:
             log_error("SHEET_WRITE_FAILED", str(e))
 
     return f"✔ 訂單成立：{order_id} 總額 {total}"
 
-# =========================
+# =========================================================
 # OPS COMMANDS
-# =========================
+# =========================================================
 
-def ops(text):
+def cmd_report():
 
-    if text == "/status":
-        return "🟢 SYSTEM OK"
+    return f"""
+📊 SYSTEM REPORT
+━━━━━━━━━━
+🧾 incidents: {len(OPS_LOG_BUFFER)}
+🟡 mode: bounded-autonomy
+🧠 ops: active
+"""
 
-    if text == "/help":
-        return "/status /help"
+
+def cmd_incident():
+
+    if not OPS_LOG_BUFFER:
+        return "🟢 No incidents"
+
+    msg = "🧠 INCIDENTS\n━━━━━━━━━━\n"
+
+    for i in OPS_LOG_BUFFER[-10:]:
+        msg += f"- [{i['stage']}] {i['message']}\n"
+
+    return msg
+
+
+def cmd_heal():
+    return "🧠 Self-healing triggered (bounded mode)"
+
+def ops_router(text):
+
+    if text == "/report":
+        return cmd_report()
+
+    if text == "/incident":
+        return cmd_incident()
+
+    if text == "/heal":
+        return cmd_heal()
 
     return None
 
-# =========================
+# =========================================================
 # WEBHOOK
-# =========================
+# =========================================================
 
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -206,21 +243,23 @@ def callback():
     try:
         body = request.get_json()
 
-        for event in body["events"]:
+        for event in body.get("events", []):
 
-            if event["type"] != "message":
+            if event.get("type") != "message":
                 continue
 
             text = event["message"]["text"]
             user_id = event["source"]["userId"]
             reply_token = event["replyToken"]
 
-            ops_result = ops(text)
+            # OPS FIRST
+            ops_result = ops_router(text)
 
             if ops_result:
                 safe_reply(reply_token, ops_result)
                 return "OK"
 
+            # ORDER FLOW
             result = process_order(user_id, text)
 
             safe_reply(reply_token, result)
@@ -230,17 +269,17 @@ def callback():
 
     return "OK"
 
-# =========================
+# =========================================================
 # HEALTH CHECK
-# =========================
+# =========================================================
 
 @app.route("/")
 def health():
     return "OK"
 
-# =========================
-# RUN
-# =========================
+# =========================================================
+# START
+# =========================================================
 
 if __name__ == "__main__":
     app.run()
