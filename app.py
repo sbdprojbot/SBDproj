@@ -1,287 +1,239 @@
-import os
-import json
-import uuid
+import os, json, time, hmac, hashlib
 from datetime import datetime
-
-from flask import Flask, request
-
-from linebot import LineBotApi
-from linebot.models import TextSendMessage
+from flask import Flask, request, abort
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
-# ==================================================
-# APP
-# ==================================================
+# =========================
+# CONFIG
+# =========================
+CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+QUEUE_FILE = "order_queue.json"
+CACHE_TTL = 10
 
 app = Flask(__name__)
 
-# ==================================================
-# ENV
-# ==================================================
+CACHE = {
+    "ws": None,
+    "ts": 0
+}
 
-LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "")
+# =========================
+# LOG
+# =========================
+def log(event, msg):
+    print(f"{event} | {msg}", flush=True)
 
-# ==================================================
-# LOG SYSTEM
-# ==================================================
+# =========================
+# LINE VERIFY
+# =========================
+def verify_signature(body, signature):
+    hash = hmac.new(
+        CHANNEL_SECRET.encode('utf-8'),
+        body,
+        hashlib.sha256
+    ).digest()
 
-EVENT_LOG = []
-REPLAY_BUFFER = []
+    import base64
+    expected = base64.b64encode(hash)
 
-def log(stage, msg):
-    EVENT_LOG.append({
-        "time": datetime.utcnow().isoformat(),
-        "stage": stage,
-        "message": str(msg)
+    return hmac.compare_digest(expected, signature.encode('utf-8'))
+
+# =========================
+# QUEUE (永不丟資料)
+# =========================
+def load_queue():
+    if not os.path.exists(QUEUE_FILE):
+        return []
+    try:
+        with open(QUEUE_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return []
+
+def save_queue(q):
+    with open(QUEUE_FILE, "w") as f:
+        json.dump(q, f)
+
+def enqueue(data):
+    q = load_queue()
+    q.append({
+        "data": data,
+        "ts": datetime.utcnow().isoformat()
     })
+    save_queue(q)
+    log("QUEUE_ADD", data)
 
-    REPLAY_BUFFER.append(EVENT_LOG[-1])
+# =========================
+# SHEET RESOLVER（核心）
+# =========================
+def get_client():
+    try:
+        return gspread.service_account(filename="service_account.json")
+    except Exception as e:
+        log("AUTH_FAIL", str(e))
+        return None
 
-    if len(EVENT_LOG) > 300:
-        EVENT_LOG.pop(0)
+def resolve_sheet(force=False):
+    now = time.time()
 
-    if len(REPLAY_BUFFER) > 50:
-        REPLAY_BUFFER.pop(0)
+    if CACHE["ws"] and not force and now - CACHE["ts"] < CACHE_TTL:
+        return CACHE["ws"]
 
-# ==================================================
-# LINE INIT
-# ==================================================
-
-line_bot_api = None
-
-try:
-    if LINE_TOKEN:
-        line_bot_api = LineBotApi(LINE_TOKEN)
-except Exception as e:
-    log("LINE_INIT_FAIL", e)
-
-# ==================================================
-# SHEET INIT
-# ==================================================
-
-client = None
-order_sheet = None
-sheet_fail_count = 0
-
-def init_sheet():
-
-    global client, order_sheet, sheet_fail_count
-
-    if not GOOGLE_CREDENTIALS:
-        log("SHEET_INIT_FAIL", "missing credentials")
-        return
+    gc = get_client()
+    if not gc:
+        return None
 
     try:
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            json.loads(GOOGLE_CREDENTIALS),
-            [
-                "https://spreadsheets.google.com/feeds",
-                "https://www.googleapis.com/auth/drive"
-            ]
-        )
+        sheets = gc.openall()
+        log("SCAN", [s.title for s in sheets])
 
-        client = gspread.authorize(creds)
+        target = None
+        keywords = ["訂單", "order", "sheet"]
 
-        sheet = client.open("pos")
-        order_sheet = sheet.worksheet("Order")
+        for k in keywords:
+            for s in sheets:
+                if k.lower() in s.title.lower():
+                    target = s
+                    break
 
-        sheet_fail_count = 0
-        log("SHEET_INIT_OK", "connected")
+        if not target and sheets:
+            target = sheets[0]
 
-    except Exception as e:
-        sheet_fail_count += 1
-        log("SHEET_INIT_FAIL", e)
-        order_sheet = None
-
-
-init_sheet()
-
-# ==================================================
-# SAFE LINE REPLY
-# ==================================================
-
-def reply(token, msg):
-
-    if not line_bot_api:
-        log("LINE_DISABLED", msg)
-        return
-
-    try:
-        line_bot_api.reply_message(
-            token,
-            TextSendMessage(text=msg)
-        )
-    except Exception as e:
-        log("LINE_REPLY_FAIL", e)
-
-# ==================================================
-# NLP PARSER
-# ==================================================
-
-def parse(text):
-
-    text = text.replace("還有", "+").replace("加上", "+")
-
-    items = []
-
-    for part in text.split("+"):
-
-        qty = 1
-
-        if "兩" in part or "2" in part:
-            qty = 2
-
-        product = "UNKNOWN"
-
-        for p in ["奶茶", "紅茶", "蛋糕", "雞腿"]:
-            if p in part:
-                product = p
-
-        items.append({
-            "product": product,
-            "qty": qty
-        })
-
-    return items
-
-# ==================================================
-# ORDER ENGINE
-# ==================================================
-
-def process_order(user_id, text):
-
-    items = parse(text)
-
-    if not order_sheet:
-        log("ORDER_FAIL", "sheet offline")
-        return "⚠ 系統忙碌，訂單已暫存失敗"
-
-    order_id = str(uuid.uuid4())
-    total = 0
-
-    for i in items:
-
-        if i["product"] == "UNKNOWN":
-            return "❗ 未建立商品"
-
-        price = 50
-        subtotal = price * i["qty"]
-        total += subtotal
+        if not target:
+            raise Exception("no sheet found")
 
         try:
-            order_sheet.append_row([
-                order_id,
-                datetime.utcnow().isoformat(),
-                user_id,
-                i["product"],
-                i["qty"],
-                subtotal,
-                total,
-                "OK"
-            ])
-        except Exception as e:
-            log("SHEET_WRITE_FAIL", e)
+            ws = target.worksheet("orders")
+        except:
+            ws = target.add_worksheet(title="orders", rows="1000", cols="20")
+            log("WS_CREATE", "orders")
 
-    return f"✔ 訂單成立 {order_id} / {total}"
+        CACHE["ws"] = ws
+        CACHE["ts"] = now
 
-# ==================================================
-# INCIDENT / OPS
-# ==================================================
+        return ws
 
-def replay():
-
-    return "\n".join([
-        f"{e['time']} | {e['stage']} | {e['message']}"
-        for e in REPLAY_BUFFER[-10:]
-    ])
-
-def incident_report():
-
-    return "\n".join([
-        f"{e['time']} | {e['stage']} | {e['message']}"
-        for e in EVENT_LOG[-20:]
-    ])
-
-def heal():
-
-    # bounded self-healing (NO LOOP)
-    try:
-        init_sheet()
-        return "🧠 heal executed (single attempt)"
     except Exception as e:
-        log("HEAL_FAIL", e)
-        return "⚠ heal failed"
+        log("RESOLVE_FAIL", str(e))
+        return None
 
-# ==================================================
-# WEBHOOK
-# ==================================================
+# =========================
+# WRITE（主寫入 + fallback）
+# =========================
+def write_row(data):
+    try:
+        ws = resolve_sheet()
+        if not ws:
+            raise Exception("no worksheet")
 
-@app.route("/callback", methods=["POST"])
+        ws.append_row(data)
+        log("WRITE_OK", data)
+        return True
+
+    except Exception as e:
+        log("WRITE_FAIL", str(e))
+        enqueue(data)
+        return False
+
+# =========================
+# RETRY（補寫）
+# =========================
+def retry_queue():
+    q = load_queue()
+    if not q:
+        return
+
+    log("RETRY_START", len(q))
+
+    new_q = []
+
+    for item in q:
+        try:
+            ws = resolve_sheet(force=True)
+            if not ws:
+                raise Exception("no sheet")
+
+            ws.append_row(item["data"])
+            log("RETRY_OK", item["data"])
+
+        except Exception as e:
+            log("RETRY_FAIL", str(e))
+            new_q.append(item)
+
+    save_queue(new_q)
+
+# =========================
+# HEAL
+# =========================
+def heal():
+    log("HEAL", "start")
+    resolve_sheet(force=True)
+    retry_queue()
+    log("HEAL", "done")
+
+# =========================
+# LINE HANDLER
+# =========================
+@app.route("/callback", methods=['POST'])
 def callback():
+    body = request.get_data()
+    signature = request.headers.get('X-Line-Signature', '')
+
+    if not verify_signature(body, signature):
+        abort(400)
+
+    data = request.get_json()
 
     try:
-        body = request.get_json()
-
-        if not body:
-            return "OK"
-
-        for event in body.get("events", []):
-
-            # filter non-text
-            if event.get("type") != "message":
+        for event in data.get("events", []):
+            if event["type"] != "message":
                 continue
 
-            if event["message"].get("type") != "text":
-                continue
+            text = event["message"]["text"]
 
-            text = event["message"].get("text", "")
-            user_id = event["source"].get("userId", "")
-            token = event.get("replyToken")
-
-            log("INPUT", text)
-
-            # OPS COMMANDS
+            # =========================
+            # OPS COMMAND
+            # =========================
             if text == "/report":
-                reply(token, incident_report())
-                continue
-
-            if text == "/incident":
-                reply(token, replay())
-                continue
+                return {
+                    "queue": load_queue()
+                }
 
             if text == "/heal":
-                reply(token, heal())
-                continue
+                heal()
+                return "heal done"
 
-            # ORDER FLOW
-            result = process_order(user_id, text)
-            reply(token, result)
+            if text == "/queue":
+                return f"queue size: {len(load_queue())}"
+
+            # =========================
+            # NORMAL WRITE
+            # =========================
+            row = [
+                datetime.utcnow().isoformat(),
+                text
+            ]
+
+            write_row(row)
 
     except Exception as e:
-        log("WEBHOOK_FAIL", e)
+        log("LINE_FAIL", str(e))
 
     return "OK"
 
-# ==================================================
-# HEALTH CHECK
-# ==================================================
+# =========================
+# BACKGROUND SELF HEAL（輕量）
+# =========================
+@app.before_request
+def auto_heal():
+    try:
+        retry_queue()
+    except:
+        pass
 
-@app.route("/")
-def health():
-    return "OK"
-
-# ==================================================
-# STARTUP LOG
-# ==================================================
-
-log("STARTUP", "system booted")
-
-# ==================================================
+# =========================
 # RUN
-# ==================================================
-
+# =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False)
+    app.run(host="0.0.0.0", port=3000)
