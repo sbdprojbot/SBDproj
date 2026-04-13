@@ -1,15 +1,59 @@
-from flask import Flask, request, abort
+from flask import Flask, request
 import re
 import time
 from datetime import datetime
 
-app = Flask(__name__)
+# LINE
+from linebot import LineBotApi
+from linebot.models import TextSendMessage
+
+# Google Sheet
+import gspread
+from google.oauth2.service_account import Credentials
 
 # =========================
-# 🧠 STATE
+# ⚙ CONFIG（請修改）
 # =========================
+
+LINE_CHANNEL_ACCESS_TOKEN = "YOUR_LINE_TOKEN"
+
+GOOGLE_CREDENTIALS_FILE = "credentials.json"
+SHEET_NAME = "LINE_POS"
+
+# =========================
+# 🚀 INIT
+# =========================
+
+app = Flask(__name__)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 
 processed_events = set()
+
+# =========================
+# 📊 GOOGLE SHEET INIT
+# =========================
+
+def init_sheet():
+    try:
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+
+        creds = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS_FILE,
+            scopes=scope
+        )
+
+        client = gspread.authorize(creds)
+        sheet = client.open(SHEET_NAME).sheet1
+        return sheet
+
+    except Exception as e:
+        print("SHEET INIT ERROR:", e)
+        return None
+
+sheet = init_sheet()
 
 # =========================
 # 🧠 UNIT ENGINE
@@ -31,7 +75,6 @@ NUM_MAP = {
 UNIT_MAP = {
     "杯":"cup",
     "瓶":"bottle",
-    "個":"piece",
     "份":"set"
 }
 
@@ -45,9 +88,8 @@ def clean(text):
     return text.strip()
 
 def parse_unit(text):
-
     qty = 1
-    unit = "piece"
+    unit = "item"
 
     for k,v in NUM_MAP.items():
         if k in text:
@@ -64,13 +106,10 @@ def parse_unit(text):
     return qty, unit
 
 def unit_engine(text):
-
     text = clean(text)
-
     qty, unit = parse_unit(text)
 
     product = text
-
     for k in list(NUM_MAP.keys()) + list(UNIT_MAP.keys()):
         product = product.replace(k,"")
 
@@ -81,6 +120,24 @@ def unit_engine(text):
         "qty": qty,
         "unit": unit
     }
+
+# =========================
+# 🧠 LOG
+# =========================
+
+def log_event(data):
+    print("LOG:", data)
+
+# =========================
+# 🧠 SHEET WRITE（安全）
+# =========================
+
+def write_sheet(data):
+    try:
+        if sheet:
+            sheet.append_row(data)
+    except Exception as e:
+        print("SHEET ERROR:", e)
 
 # =========================
 # 🧠 DEDUP
@@ -95,26 +152,22 @@ def is_duplicate(event_id):
     return False
 
 # =========================
-# 🧠 TIME
-# =========================
-
-def now():
-    return int(time.time()), datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-# =========================
-# 🧠 LOG (SAFE)
-# =========================
-
-def log_event(data):
-    print("LOG:", data)
-
-# =========================
 # 🧠 CORE ENGINE
 # =========================
 
 def handle_text(text):
 
     parsed = unit_engine(text)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 寫入 Sheet
+    write_sheet([
+        ts,
+        parsed["product"],
+        parsed["qty"],
+        parsed["unit"]
+    ])
 
     return f"✔ 訂單成立：{parsed['product']} x{parsed['qty']} ({parsed['unit']})"
 
@@ -128,13 +181,12 @@ def callback():
     try:
         body = request.get_json()
 
-        print("RAW EVENT:", body)
+        print("RAW:", body)
 
         if not body:
             return "no body", 200
 
         events = body.get("events", [])
-
         if not events:
             return "no events", 200
 
@@ -153,27 +205,15 @@ def callback():
         result = handle_text(text)
 
         log_event({
-            "event_id": event_id,
             "text": text,
             "result": result
         })
 
-        # 👉 LINE reply (safe fallback: 不會 crash)
-        try:
-            from linebot import LineBotApi
-            from linebot.models import TextSendMessage
-
-            CHANNEL_ACCESS_TOKEN = "YOUR_TOKEN_HERE"
-
-            line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
-
-            line_bot_api.reply_message(
-                reply_token,
-                TextSendMessage(text=result)
-            )
-
-        except Exception as e:
-            print("LINE REPLY ERROR:", e)
+        # LINE reply
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(text=result)
+        )
 
         return "OK", 200
 
@@ -182,12 +222,12 @@ def callback():
         return "error", 200
 
 # =========================
-# 🧪 HEALTH CHECK
+# ❤️ HEALTH CHECK
 # =========================
 
 @app.route("/", methods=["GET"])
 def home():
-    return "LINE POS SYSTEM RUNNING", 200
+    return "LINE POS RUNNING", 200
 
 # =========================
 # 🚀 RUN
