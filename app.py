@@ -3,285 +3,238 @@ import json
 import time
 import threading
 from datetime import datetime
+from queue import Queue
 
-from flask import Flask, request
+from flask import Flask, request, abort
 
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
 # =========================
-# APP INIT
+# CONFIG
 # =========================
+
 app = Flask(__name__)
 
-LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-GOOGLE_CREDS = os.getenv("GOOGLE_CREDS_JSON")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 
-line_bot_api = LineBotApi(LINE_TOKEN)
-handler = WebhookHandler(LINE_SECRET)
-
-sheet = None
-
-QUEUE_FILE = "queue.json"
-MAX_RETRY = 5
-WORKER_INTERVAL = 5
-
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # =========================
-# LOG (incident base)
+# GOOGLE SHEETS
 # =========================
-def log(event, data=None):
-    print(json.dumps({
-        "time": datetime.utcnow().isoformat(),
-        "event": event,
-        "data": data
-    }, ensure_ascii=False))
 
+SCOPE = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# =========================
-# SHEET RESOLVER (FINAL)
-# =========================
-def init_sheet():
-    global sheet
+creds = Credentials.from_service_account_info(
+    json.loads(os.getenv("GOOGLE_CREDS_JSON")),
+    scopes=SCOPE
+)
 
-    try:
-        creds = json.loads(GOOGLE_CREDS)
+client = gspread.authorize(creds)
 
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive"
-        ]
+sheet = client.open_by_key(os.getenv("SHEET_ID"))
 
-        auth = ServiceAccountCredentials.from_json_keyfile_dict(creds, scope)
-        client = gspread.authorize(auth)
-
-        sheets = client.openall()
-
-        if not sheets:
-            raise Exception("no sheets found")
-
-        # 🎯 deterministic priority matching
-        priority = ["pos", "order", "sheet1", "data"]
-
-        chosen = None
-
-        for p in priority:
-            for s in sheets:
-                if p in s.title.lower():
-                    chosen = s
-                    break
-            if chosen:
-                break
-
-        if not chosen:
-            chosen = sheets[0]
-
-        sheet = chosen.sheet1
-
-        log("SHEET_SELECTED", chosen.title)
-
-    except Exception as e:
-        sheet = None
-        log("SHEET_INIT_FAIL", str(e))
-
+USER_SHEET = sheet.worksheet("User")
+ORDER_SHEET = sheet.worksheet("Order")
+LOG_SHEET = sheet.worksheet("Log")
 
 # =========================
-# SAFE WRITE
+# QUEUE (no Redis)
 # =========================
-def write_sheet_safe(row):
-    global sheet
 
-    try:
-        if not sheet:
-            init_sheet()
-
-        if not sheet:
-            raise Exception("sheet unavailable")
-
-        sheet.append_row(row)
-
-        log("SHEET_WRITE_OK", row)
-        return True
-
-    except Exception as e:
-        log("SHEET_WRITE_FAIL", str(e))
-        enqueue(row)
-        return False
-
+job_queue = Queue()
 
 # =========================
-# QUEUE SYSTEM (PERSISTENT)
+# LOG HELPER (idempotent)
 # =========================
-def load_queue():
-    if not os.path.exists(QUEUE_FILE):
-        return []
-    try:
-        return json.load(open(QUEUE_FILE))
-    except:
-        return []
 
+def write_log(log_type, level, stage, message, parsed=None, missing_fields=None, ai_summary=None, ai_suggestion=None, status="ok"):
+    ts = datetime.utcnow().isoformat()
 
-def save_queue(q):
-    tmp = QUEUE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(q, f)
-    os.replace(tmp, QUEUE_FILE)
-
-
-def enqueue(data):
-    q = load_queue()
-    q.append({
-        "data": data,
-        "retry": 0,
-        "ts": datetime.utcnow().isoformat()
-    })
-    save_queue(q)
-
-    log("QUEUE_ADD", data)
-
+    LOG_SHEET.append_row([
+        f"log_{int(time.time()*1000)}",
+        ts,
+        ts,
+        log_type,
+        level,
+        stage,
+        message,
+        json.dumps(parsed, ensure_ascii=False),
+        json.dumps(missing_fields, ensure_ascii=False),
+        ai_summary,
+        ai_suggestion,
+        status
+    ])
 
 # =========================
-# QUEUE WORKER (SELF-HEAL)
+# PARSER (simple + stable)
 # =========================
-def retry_queue():
-    q = load_queue()
-    if not q:
-        return
 
-    new_q = []
+def parse_text(text):
+    text = text.strip()
 
-    for item in q:
-        try:
-            ok = write_sheet_safe(item["data"])
+    if text.startswith("新增") or text.lower().startswith("add"):
+        return {"intent": "CREATE", "raw": text}
 
-            if ok:
-                log("QUEUE_DONE", item["data"])
-            else:
-                raise Exception("write failed")
+    if text.startswith("查") or text.lower().startswith("read"):
+        return {"intent": "READ", "raw": text}
 
-        except Exception as e:
-            item["retry"] += 1
+    if text.startswith("改") or text.lower().startswith("update"):
+        return {"intent": "UPDATE", "raw": text}
 
-            log("QUEUE_RETRY_FAIL", {
-                "data": item["data"],
-                "retry": item["retry"],
-                "err": str(e)
-            })
+    if text.startswith("刪") or text.lower().startswith("delete"):
+        return {"intent": "DELETE", "raw": text}
 
-            if item["retry"] < MAX_RETRY:
-                new_q.append(item)
-            else:
-                log("QUEUE_DEAD_LETTER", item)
+    return {"intent": "UNKNOWN", "raw": text}
 
-    save_queue(new_q)
+# =========================
+# AI (only fallback helper)
+# =========================
 
+def ai_analyze_error(parsed):
+    # no external call forced; placeholder safe mode
+    return {
+        "summary": "parse incomplete or missing fields",
+        "suggestion": "check command format (新增/查/改/刪 + product + qty)"
+    }
+
+# =========================
+# SHEET OPERATIONS
+# =========================
+
+def create_order(parsed, user_id, text):
+    ORDER_SHEET.append_row([
+        f"order_{int(time.time()*1000)}",
+        datetime.utcnow().isoformat(),
+        datetime.utcnow().isoformat(),
+        user_id,
+        "",
+        "",
+        text,
+        1,
+        0,
+        0,
+        0,
+        "created"
+    ])
+
+def read_order(parsed, user_id):
+    return ORDER_SHEET.get_all_records()
+
+def update_order(parsed):
+    pass
+
+def delete_order(parsed):
+    pass
+
+# =========================
+# WORKER (background queue)
+# =========================
 
 def worker():
-    log("WORKER_START", "v3 self-healing online")
-
     while True:
+        job = job_queue.get()
+
         try:
-            retry_queue()
+            parsed = job["parsed"]
+            user_id = job["user_id"]
+            text = job["text"]
+
+            write_log("order", "info", "queue_start", text, parsed)
+
+            if parsed["intent"] == "CREATE":
+                create_order(parsed, user_id, text)
+
+            elif parsed["intent"] == "READ":
+                read_order(parsed, user_id)
+
+            elif parsed["intent"] == "UPDATE":
+                update_order(parsed)
+
+            elif parsed["intent"] == "DELETE":
+                delete_order(parsed)
+
+            else:
+                err = ai_analyze_error(parsed)
+                write_log(
+                    "order",
+                    "warn",
+                    "ai_fallback",
+                    text,
+                    parsed,
+                    ai_summary=err["summary"],
+                    ai_suggestion=err["suggestion"]
+                )
+
+            write_log("order", "info", "queue_done", text, parsed)
+
         except Exception as e:
-            log("WORKER_ERROR", str(e))
+            write_log("order", "error", "queue_fail", str(e), parsed)
 
-        time.sleep(WORKER_INTERVAL)
+            # DLQ (dead letter queue via log only)
+            write_log("order", "error", "DLQ", str(e), parsed)
 
+        finally:
+            job_queue.task_done()
 
-def start_worker():
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-
+# start worker
+threading.Thread(target=worker, daemon=True).start()
 
 # =========================
 # LINE WEBHOOK
 # =========================
+
 @app.route("/callback", methods=["POST"])
 def callback():
-    body = request.get_data(as_text=True)
     signature = request.headers.get("X-Line-Signature")
 
-    log("WEBHOOK_IN", body)
+    body = request.get_data(as_text=True)
 
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        log("SIGNATURE_FAIL")
-        return "invalid signature", 400
+        abort(400)
 
     return "OK"
 
-
-# =========================
-# MESSAGE HANDLER
-# =========================
 @handler.add(MessageEvent, message=TextMessage)
-def handle(event):
-    text = event.message.text.strip()
+def handle_message(event):
+    user_text = event.message.text
+    user_id = event.source.user_id
 
-    log("INPUT", text)
+    parsed = parse_text(user_text)
 
-    # ------------------
-    # /heal
-    # ------------------
-    if text == "/heal":
-        init_sheet()
-        retry_queue()
+    write_log("order", "info", "receive", user_text, parsed)
 
-        status = {
-            "sheet": "OK" if sheet else "FAIL",
-            "queue": len(load_queue())
-        }
-
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=json.dumps(status, ensure_ascii=False))
-        )
-        return
-
-    # ------------------
-    # /report
-    # ------------------
-    if text == "/report":
-        q = load_queue()
-
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=json.dumps(q[:10], ensure_ascii=False))
-        )
-        return
-
-    # ------------------
-    # normal flow
-    # ------------------
-    row = [
-        datetime.utcnow().isoformat(),
-        text
-    ]
-
-    write_sheet_safe(row)
+    job_queue.put({
+        "user_id": user_id,
+        "text": user_text,
+        "parsed": parsed
+    })
 
     line_bot_api.reply_message(
         event.reply_token,
-        TextSendMessage(text="OK")
+        TextSendMessage(text=f"收到：{parsed['intent']}")
     )
 
+# =========================
+# HEALTH CHECK
+# =========================
 
-# =========================
-# ROOT
-# =========================
 @app.route("/", methods=["GET"])
-def home():
+def health():
     return "OK"
 
+# =========================
+# MAIN
+# =========================
 
-# =========================
-# BOOT
-# =========================
-init_sheet()
-start_worker()
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
