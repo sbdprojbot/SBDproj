@@ -2,268 +2,173 @@ import os
 import json
 import time
 import uuid
-import queue
 import threading
-import traceback
 from datetime import datetime
-
 from flask import Flask, request, abort
 
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
+
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+
+import re
 
 # =========================
 # CONFIG
 # =========================
 
-APP_NAME = "SBDPROJ_SYSTEM_BD"
-
-SPREADSHEET_ID = os.getenv("SHEET_ID")  # 已凍結
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
-MAX_RETRY = 3
-QUEUE_SLEEP = 0.5
-
-# =========================
-# APP INIT
-# =========================
+if not GOOGLE_SHEET_ID:
+    raise RuntimeError("GOOGLE_SHEET_ID missing")
 
 app = Flask(__name__)
 
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
 # =========================
-# GOOGLE SHEETS INIT
+# GOOGLE SHEET INIT
 # =========================
 
-def init_gsheet():
+def init_sheet():
     try:
-        creds_dict = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT"))
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-        client = gspread.authorize(creds)
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
 
-        sheet = client.open_by_key(SPREADSHEET_ID)
+        creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+
+        if not creds_json:
+            raise RuntimeError("GOOGLE_CREDENTIALS_JSON missing")
+
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(
+            json.loads(creds_json),
+            scope
+        )
+
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(GOOGLE_SHEET_ID)
 
         return sheet
 
     except Exception as e:
-        print("[GSHEET INIT ERROR]", e)
+        print("[GSHEET INIT ERROR]", str(e))
         return None
 
 
-gsheet = init_gsheet()
+SHEET = init_sheet()
 
 # =========================
-# SHEET GETTERS
+# IN-MEMORY QUEUE (v4)
 # =========================
 
-def ws(name):
-    try:
-        return gsheet.worksheet(name)
-    except Exception:
-        return None
-
-
-def now():
-    return datetime.utcnow().isoformat()
-
-
-# =========================
-# RETRY CORE
-# =========================
-
-def retry(fn):
-    def wrapper(*args, **kwargs):
-        last_err = None
-        for i in range(MAX_RETRY):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as e:
-                last_err = e
-                time.sleep(2 ** i)
-        raise last_err
-    return wrapper
-
-
-# =========================
-# LOG SYSTEM (ONLY STORAGE)
-# =========================
-
-def log_event(level="INFO", stage="SYSTEM", message="", parsed=None, missing=None, ai_summary="", ai_suggestion="", status="OK", _type="LOG"):
-    try:
-        sheet = ws("Log")
-        if not sheet:
-            return
-
-        sheet.append_row([
-            str(uuid.uuid4()),
-            now(),
-            now(),
-            _type,
-            level,
-            stage,
-            message,
-            json.dumps(parsed, ensure_ascii=False),
-            json.dumps(missing, ensure_ascii=False),
-            ai_summary,
-            ai_suggestion,
-            status
-        ])
-    except Exception:
-        pass
-
-
-# =========================
-# DEAD LETTER QUEUE (DLQ)
-# =========================
-
+QUEUE = []
 DLQ = []
+LOCK = threading.Lock()
 
-
-def push_dlq(payload, err):
-    DLQ.append({
-        "payload": payload,
-        "error": str(err),
-        "time": now()
-    })
-
-    log_event(
-        level="ERROR",
-        stage="DLQ",
-        message=str(err),
-        parsed=payload,
-        status="DLQ"
-    )
-
-
-# =========================
-# QUEUE SYSTEM (NO REDIS)
-# =========================
-
-task_queue = queue.Queue()
+def enqueue(task):
+    with LOCK:
+        QUEUE.append({
+            "task": task,
+            "retry": 0
+        })
 
 
 def worker():
     while True:
-        task = task_queue.get()
+        if not QUEUE:
+            time.sleep(0.5)
+            continue
+
+        with LOCK:
+            job = QUEUE.pop(0)
+
         try:
-            task()
+            process_task(job["task"])
+
         except Exception as e:
-            push_dlq(str(task), e)
-        task_queue.task_done()
-        time.sleep(QUEUE_SLEEP)
+            job["retry"] += 1
+
+            if job["retry"] <= 3:
+                time.sleep(2 ** job["retry"])
+                enqueue(job["task"])
+            else:
+                DLQ.append(job)
+                log("error", "dlq", str(e), job["task"])
+
+        time.sleep(0.1)
 
 
 threading.Thread(target=worker, daemon=True).start()
 
-
-def enqueue(fn):
-    task_queue.put(fn)
-
-
 # =========================
-# SHEET SAFE OPS
+# LOG SYSTEM
 # =========================
 
-@retry
-def insert_row(sheet_name, row):
-    sheet = ws(sheet_name)
-    if not sheet:
-        raise Exception(f"Sheet missing: {sheet_name}")
-    sheet.append_row(row)
+def log(level, stage, message, parsed=None):
+    try:
+        ws = SHEET.worksheet("Log")
 
-
-# =========================
-# BUSINESS OPS (CORE)
-# =========================
-
-def create_product(data):
-    def task():
-        insert_row("Product", [
-            data.get("Product_id", str(uuid.uuid4())),
-            data.get("product"),
-            data.get("price"),
-            data.get("category"),
-            data.get("stock", 0),
-            data.get("status", "active"),
-            now(),
-            now()
+        ws.append_row([
+            str(uuid.uuid4()),
+            str(datetime.utcnow()),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "system",
+            level,
+            stage,
+            message,
+            json.dumps(parsed, ensure_ascii=False) if parsed else "",
+            "",
+            "",
+            "",
+            "ok"
         ])
-
-        log_event(stage="PRODUCT_CREATE", message="created", parsed=data)
-
-    enqueue(task)
-
-
-def create_order(data):
-    def task():
-        insert_row("Order", [
-            data.get("Order_id", str(uuid.uuid4())),
-            now(),
-            now(),
-            data.get("user_id"),
-            data.get("name"),
-            data.get("product_id"),
-            data.get("product"),
-            data.get("qty", 1),
-            data.get("unit_price", 0),
-            data.get("subtotal", 0),
-            data.get("order_total", 0),
-            data.get("status", "created")
-        ])
-
-        log_event(stage="ORDER_CREATE", message="created", parsed=data)
-
-    enqueue(task)
-
-
-def create_user(data):
-    def task():
-        insert_row("User", [
-            data.get("User_id", str(uuid.uuid4())),
-            data.get("name"),
-            data.get("phone"),
-            data.get("address"),
-            now(),
-            now(),
-            data.get("status", "active")
-        ])
-
-        log_event(stage="USER_CREATE", message="created", parsed=data)
-
-    enqueue(task)
-
+    except Exception as e:
+        print("[LOG ERROR]", e)
 
 # =========================
-# SIMPLE PARSER (LINE NLP v4 light)
+# PARSER (AI-lite engine)
 # =========================
 
-def parse_text(text):
+def parse_message(text):
+
     text = text.strip()
 
-    # product create
-    if text.startswith("add product"):
-        parts = text.split()
-        return {
-            "type": "product",
-            "action": "create",
-            "product": parts[2] if len(parts) > 2 else None
-        }
+    # ORDER PATTERN
+    order_match = re.search(r"(\d+)\s*(個|件|pcs|x)?\s*(.*)", text)
 
-    # order create
-    if text.startswith("order"):
+    if "買" in text or "order" in text.lower():
         return {
             "type": "order",
-            "raw": text
+            "product": text,
+            "qty": 1
         }
 
-    # user create
-    if text.startswith("user"):
+    # PRODUCT QUERY
+    if "庫存" in text or "product" in text.lower():
         return {
-            "type": "user",
-            "raw": text
+            "type": "product_query",
+            "query": text
+        }
+
+    # USER QUERY
+    if "user" in text.lower():
+        return {
+            "type": "user_query",
+            "query": text
+        }
+
+    # math fallback
+    if any(op in text for op in ["+", "-", "*", "x", "÷"]):
+        return {
+            "type": "math",
+            "expr": text
         }
 
     return {
@@ -271,76 +176,74 @@ def parse_text(text):
         "raw": text
     }
 
-
 # =========================
-# AI LAYER (OPTIONAL SAFE)
+# CORE EXECUTION
 # =========================
 
-def ai_analyze(text, parsed):
-    try:
-        # optional: plug OpenAI later
-        return {
-            "summary": "parsed",
-            "suggestion": "ok"
-        }
-    except:
-        return None
+def process_task(task):
 
+    ttype = task.get("type")
+
+    if ttype == "order":
+        log("info", "order", "processing", task)
+
+    elif ttype == "product_query":
+        log("info", "product", "query", task)
+
+    elif ttype == "user_query":
+        log("info", "user", "query", task)
+
+    elif ttype == "math":
+        log("info", "math", "compute", task)
+
+    else:
+        log("warn", "unknown", "cannot parse", task)
 
 # =========================
 # LINE WEBHOOK
 # =========================
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
+@app.route("/callback", methods=["POST"])
+def callback():
+
+    signature = request.headers.get("X-Line-Signature")
     body = request.get_data(as_text=True)
 
-    log_event(stage="WEBHOOK_IN", message=body)
-
     try:
-        data = json.loads(body)
-    except:
-        return "OK"
-
-    # simplified handler
-    msg = data.get("message", {}).get("text", "")
-    parsed = parse_text(msg)
-
-    ai = ai_analyze(msg, parsed)
-
-    log_event(
-        stage="PARSE",
-        message=msg,
-        parsed=parsed,
-        ai_summary=ai.get("summary") if ai else "",
-        ai_suggestion=ai.get("suggestion") if ai else ""
-    )
-
-    # route
-    if parsed["type"] == "product":
-        create_product(parsed)
-
-    elif parsed["type"] == "order":
-        create_order(parsed)
-
-    elif parsed["type"] == "user":
-        create_user(parsed)
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
 
     return "OK"
 
 
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+
+    user_text = event.message.text
+
+    parsed = parse_message(user_text)
+
+    enqueue(parsed)
+
+    reply = f"已收到：{parsed['type']}"
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply)
+    )
+
 # =========================
-# HEALTH CHECK
+# ROOT
 # =========================
 
 @app.route("/", methods=["GET"])
-def health():
-    return {"status": "ok", "app": APP_NAME}
-
+def home():
+    return "SBDPROJ_SYSTEM_BD v4 ONLINE"
 
 # =========================
-# START
+# MAIN
 # =========================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    app.run(host="0.0.0.0", port=10000)
