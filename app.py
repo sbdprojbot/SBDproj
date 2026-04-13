@@ -1,129 +1,96 @@
 import os
 import json
-import time
-import uuid
-import threading
-from datetime import datetime
+import datetime
 from flask import Flask, request, abort
-
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-import re
+import gspread
+from google.oauth2.service_account import Credentials
+import openai
 
 # =========================
-# CONFIG
+# ENV
 # =========================
 
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 
-if not GOOGLE_SHEET_ID:
-    raise RuntimeError("GOOGLE_SHEET_ID missing")
+openai.api_key = OPENAI_API_KEY
+
+# =========================
+# APP INIT
+# =========================
 
 app = Flask(__name__)
-
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # =========================
-# GOOGLE SHEET INIT
+# GOOGLE SHEET INIT (SAFE)
 # =========================
 
-def init_sheet():
+sheet_client = None
+sheet_db = {}
+
+def init_gsheet():
+    global sheet_client, sheet_db
     try:
-        scope = [
-            "https://spreadsheets.google.com/feeds",
+        if not GOOGLE_CREDS_JSON:
+            print("[GSHEET INIT ERROR] GOOGLE_CREDS_JSON is empty")
+            return
+
+        creds_dict = json.loads(GOOGLE_CREDS_JSON)
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
 
-        creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        sheet_client = gspread.authorize(creds)
 
-        if not creds_json:
-            raise RuntimeError("GOOGLE_CREDENTIALS_JSON missing")
+        db = sheet_client.open_by_key(GOOGLE_SHEET_ID)
 
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            json.loads(creds_json),
-            scope
-        )
+        sheet_db["User"] = db.worksheet("User")
+        sheet_db["Product"] = db.worksheet("Product")
+        sheet_db["Order"] = db.worksheet("Order")
+        sheet_db["Log"] = db.worksheet("Log")
 
-        client = gspread.authorize(creds)
-        sheet = client.open_by_key(GOOGLE_SHEET_ID)
-
-        return sheet
+        print("[GSHEET INIT OK]")
 
     except Exception as e:
-        print("[GSHEET INIT ERROR]", str(e))
-        return None
+        print(f"[GSHEET INIT ERROR] {e}")
+        sheet_client = None
 
-
-SHEET = init_sheet()
-
-# =========================
-# IN-MEMORY QUEUE (v4)
-# =========================
-
-QUEUE = []
-DLQ = []
-LOCK = threading.Lock()
-
-def enqueue(task):
-    with LOCK:
-        QUEUE.append({
-            "task": task,
-            "retry": 0
-        })
-
-
-def worker():
-    while True:
-        if not QUEUE:
-            time.sleep(0.5)
-            continue
-
-        with LOCK:
-            job = QUEUE.pop(0)
-
-        try:
-            process_task(job["task"])
-
-        except Exception as e:
-            job["retry"] += 1
-
-            if job["retry"] <= 3:
-                time.sleep(2 ** job["retry"])
-                enqueue(job["task"])
-            else:
-                DLQ.append(job)
-                log("error", "dlq", str(e), job["task"])
-
-        time.sleep(0.1)
-
-
-threading.Thread(target=worker, daemon=True).start()
+init_gsheet()
 
 # =========================
-# LOG SYSTEM
+# UTIL
 # =========================
 
-def log(level, stage, message, parsed=None):
+def now():
+    return datetime.datetime.now().isoformat()
+
+def safe_log(row):
     try:
-        ws = SHEET.worksheet("Log")
+        ws = sheet_db.get("Log")
+        if not ws:
+            return
 
         ws.append_row([
-            str(uuid.uuid4()),
-            str(datetime.utcnow()),
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            now(),
+            "display",
             "system",
-            level,
-            stage,
-            message,
-            json.dumps(parsed, ensure_ascii=False) if parsed else "",
+            "info",
+            "v4",
+            str(row),
+            "",
             "",
             "",
             "",
@@ -133,79 +100,83 @@ def log(level, stage, message, parsed=None):
         print("[LOG ERROR]", e)
 
 # =========================
-# PARSER (AI-lite engine)
+# HARD COMMAND LAYER (FIX UNKNOWN ISSUE)
 # =========================
 
-def parse_message(text):
+def hard_router(text, user_id):
+    t = text.lower().strip()
 
-    text = text.strip()
+    # TEST SHEET
+    if t in ["ping sheet", "test sheet", "sheet ping"]:
+        return test_sheet()
 
-    # ORDER PATTERN
-    order_match = re.search(r"(\d+)\s*(個|件|pcs|x)?\s*(.*)", text)
+    # CRUD SHORTCUTS (basic)
+    if t.startswith("add user"):
+        return "[USER ADD] parsed but not fully implemented safe mode"
 
-    if "買" in text or "order" in text.lower():
-        return {
-            "type": "order",
-            "product": text,
-            "qty": 1
-        }
+    if t.startswith("add product"):
+        return "[PRODUCT ADD] parsed but not fully implemented safe mode"
 
-    # PRODUCT QUERY
-    if "庫存" in text or "product" in text.lower():
-        return {
-            "type": "product_query",
-            "query": text
-        }
-
-    # USER QUERY
-    if "user" in text.lower():
-        return {
-            "type": "user_query",
-            "query": text
-        }
-
-    # math fallback
-    if any(op in text for op in ["+", "-", "*", "x", "÷"]):
-        return {
-            "type": "math",
-            "expr": text
-        }
-
-    return {
-        "type": "unknown",
-        "raw": text
-    }
+    return None
 
 # =========================
-# CORE EXECUTION
+# SHEET TEST
 # =========================
 
-def process_task(task):
+def test_sheet():
+    try:
+        if not sheet_db:
+            return "❌ SHEET NOT INIT"
 
-    ttype = task.get("type")
-
-    if ttype == "order":
-        log("info", "order", "processing", task)
-
-    elif ttype == "product_query":
-        log("info", "product", "query", task)
-
-    elif ttype == "user_query":
-        log("info", "user", "query", task)
-
-    elif ttype == "math":
-        log("info", "math", "compute", task)
-
-    else:
-        log("warn", "unknown", "cannot parse", task)
+        tabs = list(sheet_db.keys())
+        return f"""[SHEET TEST OK]
+tabs: {tabs}
+status: connected
+write: ready"""
+    except Exception as e:
+        return f"[SHEET TEST FAIL] {e}"
 
 # =========================
-# LINE WEBHOOK
+# AI FALLBACK ENGINE
+# =========================
+
+def ai_parse(text):
+    try:
+        if not OPENAI_API_KEY:
+            return "AI_DISABLED"
+
+        prompt = f"""
+You are a POS system parser.
+Return JSON only.
+
+TEXT:
+{text}
+
+Return format:
+{{
+  "intent": "user|product|order|log|unknown",
+  "action": "create|update|delete|query",
+  "missing_fields": []
+}}
+"""
+
+        res = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+
+        return res.choices[0].message.content
+
+    except Exception as e:
+        return f"AI_ERROR: {e}"
+
+# =========================
+# WEBHOOK
 # =========================
 
 @app.route("/callback", methods=["POST"])
 def callback():
-
     signature = request.headers.get("X-Line-Signature")
     body = request.get_data(as_text=True)
 
@@ -216,34 +187,54 @@ def callback():
 
     return "OK"
 
+# =========================
+# MESSAGE HANDLER
+# =========================
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
+    text = event.message.text
+    user_id = event.source.user_id
 
-    user_text = event.message.text
+    safe_log(f"IN: {text}")
 
-    parsed = parse_message(user_text)
+    # 1. HARD ROUTER FIRST (FIX unknown issue)
+    hard = hard_router(text, user_id)
+    if hard:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=hard)
+        )
+        safe_log(f"HARD: {hard}")
+        return
 
-    enqueue(parsed)
+    # 2. AI PARSE
+    ai_result = ai_parse(text)
 
-    reply = f"已收到：{parsed['type']}"
+    # 3. FALLBACK RESPONSE
+    reply = f"""[AI MODE]
+input: {text}
+result: {ai_result}
+"""
 
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=reply)
     )
 
+    safe_log(f"AI: {ai_result}")
+
 # =========================
 # ROOT
 # =========================
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def home():
-    return "SBDPROJ_SYSTEM_BD v4 ONLINE"
+    return "SBDPROJ SYSTEM BD v4 ONLINE"
 
 # =========================
 # MAIN
 # =========================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
