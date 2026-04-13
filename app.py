@@ -1,239 +1,236 @@
-import os, json, time, hmac, hashlib
+import os
+import json
+import traceback
 from datetime import datetime
+
 from flask import Flask, request, abort
 
+# LINE
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+
+# Google Sheet
 import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# =========================
-# CONFIG
-# =========================
-CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-QUEUE_FILE = "order_queue.json"
-CACHE_TTL = 10
+# OpenAI（可選）
+from openai import OpenAI
 
+# ======================
+# ENV
+# ======================
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Sheet config（不用填死，會自動找）
+TARGET_SHEET_NAME = os.getenv("SHEET_NAME", "")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
+
+# ======================
+# INIT
+# ======================
 app = Flask(__name__)
 
-CACHE = {
-    "ws": None,
-    "ts": 0
-}
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# =========================
-# LOG
-# =========================
-def log(event, msg):
-    print(f"{event} | {msg}", flush=True)
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# =========================
-# LINE VERIFY
-# =========================
-def verify_signature(body, signature):
-    hash = hmac.new(
-        CHANNEL_SECRET.encode('utf-8'),
-        body,
-        hashlib.sha256
-    ).digest()
+sheet = None
 
-    import base64
-    expected = base64.b64encode(hash)
 
-    return hmac.compare_digest(expected, signature.encode('utf-8'))
+# ======================
+# LOG SYSTEM
+# ======================
+def log(event, data=None):
+    print(json.dumps({
+        "time": datetime.utcnow().isoformat(),
+        "event": event,
+        "data": data
+    }, ensure_ascii=False))
 
-# =========================
-# QUEUE (永不丟資料)
-# =========================
-def load_queue():
-    if not os.path.exists(QUEUE_FILE):
-        return []
+
+# ======================
+# SHEET AUTO RESOLVER
+# ======================
+def init_sheet():
+    global sheet
+
     try:
-        with open(QUEUE_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return []
+        creds_dict = json.loads(GOOGLE_CREDS_JSON)
 
-def save_queue(q):
-    with open(QUEUE_FILE, "w") as f:
-        json.dump(q, f)
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
 
-def enqueue(data):
-    q = load_queue()
-    q.append({
-        "data": data,
-        "ts": datetime.utcnow().isoformat()
-    })
-    save_queue(q)
-    log("QUEUE_ADD", data)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
 
-# =========================
-# SHEET RESOLVER（核心）
-# =========================
-def get_client():
-    try:
-        return gspread.service_account(filename="service_account.json")
+        spreadsheets = client.openall()
+
+        # 🎯 1. 指定名稱優先
+        if TARGET_SHEET_NAME:
+            for s in spreadsheets:
+                if TARGET_SHEET_NAME in s.title:
+                    log("SHEET_FOUND_BY_NAME", s.title)
+                    sheet = s.sheet1
+                    return
+
+        # 🎯 2. fallback：抓第一個
+        if spreadsheets:
+            log("SHEET_FALLBACK_FIRST", spreadsheets[0].title)
+            sheet = spreadsheets[0].sheet1
+            return
+
+        log("SHEET_NOT_FOUND")
+
     except Exception as e:
-        log("AUTH_FAIL", str(e))
-        return None
+        log("SHEET_INIT_FAIL", str(e))
+        sheet = None
 
-def resolve_sheet(force=False):
-    now = time.time()
 
-    if CACHE["ws"] and not force and now - CACHE["ts"] < CACHE_TTL:
-        return CACHE["ws"]
+# ======================
+# WRITE SHEET (RETRY)
+# ======================
+def write_sheet_safe(row):
+    global sheet
 
-    gc = get_client()
-    if not gc:
-        return None
-
-    try:
-        sheets = gc.openall()
-        log("SCAN", [s.title for s in sheets])
-
-        target = None
-        keywords = ["訂單", "order", "sheet"]
-
-        for k in keywords:
-            for s in sheets:
-                if k.lower() in s.title.lower():
-                    target = s
-                    break
-
-        if not target and sheets:
-            target = sheets[0]
-
-        if not target:
-            raise Exception("no sheet found")
-
+    for i in range(3):
         try:
-            ws = target.worksheet("orders")
-        except:
-            ws = target.add_worksheet(title="orders", rows="1000", cols="20")
-            log("WS_CREATE", "orders")
+            if not sheet:
+                init_sheet()
 
-        CACHE["ws"] = ws
-        CACHE["ts"] = now
+            if not sheet:
+                raise Exception("sheet not ready")
 
-        return ws
-
-    except Exception as e:
-        log("RESOLVE_FAIL", str(e))
-        return None
-
-# =========================
-# WRITE（主寫入 + fallback）
-# =========================
-def write_row(data):
-    try:
-        ws = resolve_sheet()
-        if not ws:
-            raise Exception("no worksheet")
-
-        ws.append_row(data)
-        log("WRITE_OK", data)
-        return True
-
-    except Exception as e:
-        log("WRITE_FAIL", str(e))
-        enqueue(data)
-        return False
-
-# =========================
-# RETRY（補寫）
-# =========================
-def retry_queue():
-    q = load_queue()
-    if not q:
-        return
-
-    log("RETRY_START", len(q))
-
-    new_q = []
-
-    for item in q:
-        try:
-            ws = resolve_sheet(force=True)
-            if not ws:
-                raise Exception("no sheet")
-
-            ws.append_row(item["data"])
-            log("RETRY_OK", item["data"])
+            sheet.append_row(row)
+            log("SHEET_WRITE_OK", row)
+            return True
 
         except Exception as e:
-            log("RETRY_FAIL", str(e))
-            new_q.append(item)
+            log("SHEET_WRITE_FAIL", {"retry": i, "error": str(e)})
+            sheet = None
 
-    save_queue(new_q)
+    return False
 
-# =========================
-# HEAL
-# =========================
-def heal():
-    log("HEAL", "start")
-    resolve_sheet(force=True)
-    retry_queue()
-    log("HEAL", "done")
 
-# =========================
-# LINE HANDLER
-# =========================
-@app.route("/callback", methods=['POST'])
-def callback():
-    body = request.get_data()
-    signature = request.headers.get('X-Line-Signature', '')
-
-    if not verify_signature(body, signature):
-        abort(400)
-
-    data = request.get_json()
+# ======================
+# AI（可選）
+# ======================
+def ai_reply(text):
+    if not openai_client:
+        return "（AI 未啟用）"
 
     try:
-        for event in data.get("events", []):
-            if event["type"] != "message":
-                continue
-
-            text = event["message"]["text"]
-
-            # =========================
-            # OPS COMMAND
-            # =========================
-            if text == "/report":
-                return {
-                    "queue": load_queue()
-                }
-
-            if text == "/heal":
-                heal()
-                return "heal done"
-
-            if text == "/queue":
-                return f"queue size: {len(load_queue())}"
-
-            # =========================
-            # NORMAL WRITE
-            # =========================
-            row = [
-                datetime.utcnow().isoformat(),
-                text
-            ]
-
-            write_row(row)
+        res = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": text}]
+        )
+        return res.choices[0].message.content
 
     except Exception as e:
-        log("LINE_FAIL", str(e))
+        log("AI_FAIL", str(e))
+        return "AI 發生錯誤"
+
+
+# ======================
+# CALLBACK
+# ======================
+@app.route("/callback", methods=["POST"])
+def callback():
+    body = request.get_data(as_text=True)
+    signature = request.headers.get("X-Line-Signature")
+
+    log("WEBHOOK_IN", body)
+
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        log("SIGNATURE_FAIL")
+        return "signature error", 400
+    except Exception as e:
+        log("WEBHOOK_ERROR", str(e))
+        return "error", 500
 
     return "OK"
 
-# =========================
-# BACKGROUND SELF HEAL（輕量）
-# =========================
-@app.before_request
-def auto_heal():
-    try:
-        retry_queue()
-    except:
-        pass
 
-# =========================
-# RUN
-# =========================
+# ======================
+# MESSAGE HANDLER
+# ======================
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    text = event.message.text.strip()
+
+    log("USER_MSG", text)
+
+    # ======================
+    # /heal（系統自檢）
+    # ======================
+    if text.lower() == "/heal":
+        try:
+            init_sheet()
+
+            status = {
+                "sheet": "OK" if sheet else "FAIL",
+                "ai": "ON" if openai_client else "OFF"
+            }
+
+            reply = f"System Check:\nSheet: {status['sheet']}\nAI: {status['ai']}"
+            send_reply(event, reply)
+
+        except Exception as e:
+            send_reply(event, f"heal error: {str(e)}")
+
+        return
+
+    # ======================
+    # 一般訊息 → AI
+    # ======================
+    ai_text = ai_reply(text)
+
+    # ======================
+    # 寫入 Sheet（不中斷流程）
+    # ======================
+    row = [
+        datetime.now().isoformat(),
+        text,
+        ai_text
+    ]
+
+    write_sheet_safe(row)
+
+    send_reply(event, ai_text)
+
+
+# ======================
+# REPLY SAFE
+# ======================
+def send_reply(event, text):
+    try:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=text[:5000])
+        )
+    except Exception as e:
+        log("REPLY_FAIL", str(e))
+
+
+# ======================
+# ROOT（避免 404 誤判）
+# ======================
+@app.route("/", methods=["GET"])
+def home():
+    return "OK"
+
+
+# ======================
+# STARTUP
+# ======================
+init_sheet()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=3000)
+    app.run(host="0.0.0.0", port=8080)
