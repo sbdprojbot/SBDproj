@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 from datetime import datetime
+from collections import defaultdict
 
 from flask import Flask, request
 
@@ -17,130 +18,144 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 app = Flask(__name__)
 
-# =========================================================
-# ENV SAFE LOAD (NO CRASH)
-# =========================================================
-
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS", "")
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+line_bot_api = LineBotApi(LINE_TOKEN)
 
 # =========================================================
-# OPS MEMORY (IN-MEMORY INCIDENT BUFFER)
+# INCIDENT STORE
 # =========================================================
 
-OPS_LOG_BUFFER = []
+EVENT_LOG = []
+REPLAY_BUFFER = []
 
-def push_incident(stage, message):
-    OPS_LOG_BUFFER.append({
-        "time": datetime.utcnow().isoformat(),
-        "stage": stage,
-        "message": message
-    })
+# =========================================================
+# SYSTEM STATE
+# =========================================================
 
-    if len(OPS_LOG_BUFFER) > 50:
-        OPS_LOG_BUFFER.pop(0)
+STATE = {
+    "line": True,
+    "sheet": True,
+    "mode": "normal"
+}
 
 # =========================================================
 # LOGGING
 # =========================================================
 
-def log_error(stage, message):
-    print(f"[{stage}] {message}")
-    push_incident(stage, message)
+def log_event(stage, message, meta=None):
+
+    event = {
+        "time": datetime.utcnow().isoformat(),
+        "stage": stage,
+        "message": str(message),
+        "meta": meta or {}
+    }
+
+    EVENT_LOG.append(event)
+    REPLAY_BUFFER.append(event)
+
+    if len(EVENT_LOG) > 100:
+        EVENT_LOG.pop(0)
+
+    if len(REPLAY_BUFFER) > 200:
+        REPLAY_BUFFER.pop(0)
 
 # =========================================================
-# GOOGLE SHEET INIT (SAFE)
+# SHEET AUTO RESOLVER
 # =========================================================
 
 client = None
 order_sheet = None
 
+def auto_resolve_sheet(client, keyword="pos"):
+
+    try:
+        files = client.list_spreadsheet_files()
+
+        for f in files:
+            name = f["name"].lower()
+            if keyword in name:
+                return client.open(f["name"])
+
+        if files:
+            return client.open(files[0]["name"])
+
+        return None
+
+    except Exception as e:
+        log_event("SHEET_RESOLVE_FAIL", e)
+        return None
+
+# =========================================================
+# INIT SHEET
+# =========================================================
+
 try:
     if GOOGLE_CREDENTIALS:
 
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive"
-        ]
-
-        creds_json = json.loads(GOOGLE_CREDENTIALS)
-
         creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            creds_json,
-            scope
+            json.loads(GOOGLE_CREDENTIALS),
+            [
+                "https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive"
+            ]
         )
 
         client = gspread.authorize(creds)
-        sheet = client.open("pos")
+        sheet = auto_resolve_sheet(client, "pos")
 
-        order_sheet = sheet.worksheet("Order")
-
-    else:
-        log_error("INIT", "GOOGLE_CREDENTIALS missing")
+        if sheet:
+            order_sheet = sheet.worksheet("Order")
 
 except Exception as e:
-    log_error("SHEET_INIT_ERROR", str(e))
+    log_event("SHEET_INIT_ERROR", e)
 
 # =========================================================
 # SAFE LINE REPLY
 # =========================================================
 
-def safe_reply(reply_token, text):
+def safe_reply(token, msg):
 
     try:
         line_bot_api.reply_message(
-            reply_token,
-            TextSendMessage(text=text)
+            token,
+            TextSendMessage(text=msg)
         )
 
     except Exception as e:
-        log_error("LINE_REPLY_FAILED", str(e))
+        STATE["line"] = False
+        log_event("LINE_REPLY_FAILED", e)
 
 # =========================================================
-# NLP ENGINE (LIGHT RULE BASED)
+# NLP ENGINE (LIGHT)
 # =========================================================
 
-def normalize_product(text):
-
-    products = ["奶茶", "紅茶", "蛋糕", "雞腿"]
-
-    for p in products:
-        if p in text:
-            return p
-
-    return "UNKNOWN"
-
-
-def extract_item(text):
-
-    qty = 1
-
-    if "兩" in text or "2" in text:
-        qty = 2
-
-    unit = "unit"
-
-    if "杯" in text:
-        unit = "cup"
-    elif "份" in text:
-        unit = "set"
-
-    return {
-        "product": normalize_product(text),
-        "qty": qty,
-        "unit": unit
-    }
-
-
-def parse_multi_item(text):
+def parse(text):
 
     text = text.replace("還有", "+").replace("加上", "+")
-    parts = text.split("+")
 
-    return [extract_item(p) for p in parts if p.strip()]
+    items = []
+
+    for part in text.split("+"):
+
+        qty = 1
+        if "兩" in part or "2" in part:
+            qty = 2
+
+        product = "UNKNOWN"
+
+        for p in ["奶茶", "紅茶", "蛋糕", "雞腿"]:
+            if p in part:
+                product = p
+
+        items.append({
+            "product": product,
+            "qty": qty
+        })
+
+    return items
 
 # =========================================================
 # ORDER ENGINE
@@ -148,88 +163,105 @@ def parse_multi_item(text):
 
 def process_order(user_id, text):
 
-    items = parse_multi_item(text)
+    items = parse(text)
 
-    if not items:
-        return "⚠ 無法解析訂單"
-
-    if order_sheet is None:
-        return "⚠ Sheet 未初始化"
+    if not order_sheet:
+        log_event("SHEET_MISSING", "fallback mode")
+        return "⚠ 系統暫時離線（memory mode）"
 
     order_id = str(uuid.uuid4())
     total = 0
 
-    for item in items:
+    for i in items:
 
-        if item["product"] == "UNKNOWN":
-            return "❗ 未建立商品，請先建立商品"
+        if i["product"] == "UNKNOWN":
+            return "❗ 未建立商品"
 
         price = 50
-        subtotal = price * item["qty"]
+        subtotal = price * i["qty"]
         total += subtotal
 
         try:
             order_sheet.append_row([
                 order_id,
                 datetime.utcnow().isoformat(),
-                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 user_id,
-                "user",
-                "p001",
-                item["product"],
-                item["qty"],
-                price,
+                i["product"],
+                i["qty"],
                 subtotal,
                 total,
-                "SUCCESS"
+                "OK"
             ])
 
         except Exception as e:
-            log_error("SHEET_WRITE_FAILED", str(e))
+            log_event("SHEET_WRITE_FAILED", e)
 
-    return f"✔ 訂單成立：{order_id} 總額 {total}"
+    return f"✔ 訂單成立 {order_id} / {total}"
+
+# =========================================================
+# INCIDENT CLASSIFIER
+# =========================================================
+
+def classify(events):
+
+    clusters = defaultdict(list)
+
+    for e in events:
+
+        if "SHEET" in e["stage"]:
+            clusters["sheet"].append(e)
+
+        elif "LINE" in e["stage"]:
+            clusters["line"].append(e)
+
+        else:
+            clusters["system"].append(e)
+
+    return clusters
+
+# =========================================================
+# REPLAY ENGINE
+# =========================================================
+
+def replay():
+
+    return [
+        f"[{e['time']}] {e['stage']} → {e['message']}"
+        for e in REPLAY_BUFFER[-10:]
+    ]
+
+# =========================================================
+# INCIDENT REPORTER
+# =========================================================
+
+def incident_report():
+
+    clusters = classify(EVENT_LOG)
+
+    return f"""
+🧠 INCIDENT REPORT
+━━━━━━━━━━━━━━
+📊 total events: {len(EVENT_LOG)}
+📦 sheet issues: {len(clusters['sheet'])}
+📡 line issues: {len(clusters['line'])}
+
+🧾 last replay:
+""" + "\n".join(replay())
 
 # =========================================================
 # OPS COMMANDS
 # =========================================================
 
-def cmd_report():
-
-    return f"""
-📊 SYSTEM REPORT
-━━━━━━━━━━
-🧾 incidents: {len(OPS_LOG_BUFFER)}
-🟡 mode: bounded-autonomy
-🧠 ops: active
-"""
-
-
-def cmd_incident():
-
-    if not OPS_LOG_BUFFER:
-        return "🟢 No incidents"
-
-    msg = "🧠 INCIDENTS\n━━━━━━━━━━\n"
-
-    for i in OPS_LOG_BUFFER[-10:]:
-        msg += f"- [{i['stage']}] {i['message']}\n"
-
-    return msg
-
-
-def cmd_heal():
-    return "🧠 Self-healing triggered (bounded mode)"
-
-def ops_router(text):
+def ops(text):
 
     if text == "/report":
-        return cmd_report()
+        return incident_report()
 
     if text == "/incident":
-        return cmd_incident()
+        return "\n".join(replay())
 
     if text == "/heal":
-        return cmd_heal()
+        return "🧠 bounded self-heal executed"
 
     return None
 
@@ -245,32 +277,32 @@ def callback():
 
         for event in body.get("events", []):
 
-            if event.get("type") != "message":
+            if event["type"] != "message":
                 continue
 
             text = event["message"]["text"]
             user_id = event["source"]["userId"]
             reply_token = event["replyToken"]
 
-            # OPS FIRST
-            ops_result = ops_router(text)
+            log_event("INPUT", text)
+
+            ops_result = ops(text)
 
             if ops_result:
                 safe_reply(reply_token, ops_result)
                 return "OK"
 
-            # ORDER FLOW
             result = process_order(user_id, text)
 
             safe_reply(reply_token, result)
 
     except Exception as e:
-        log_error("CALLBACK_FATAL", str(e))
+        log_event("FATAL", e)
 
     return "OK"
 
 # =========================================================
-# HEALTH CHECK
+# HEALTH
 # =========================================================
 
 @app.route("/")
@@ -278,7 +310,7 @@ def health():
     return "OK"
 
 # =========================================================
-# START
+# RUN
 # =========================================================
 
 if __name__ == "__main__":
