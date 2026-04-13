@@ -1,178 +1,203 @@
-from flask import Flask, request
-import re
-import time
+import os
+import json
+import uuid
 from datetime import datetime
 
-# LINE
-from linebot import LineBotApi
+from flask import Flask, request
+
+from linebot import LineBotApi, WebhookHandler
 from linebot.models import TextSendMessage
 
-# Google Sheet
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
 
 # =========================
-# ⚙ CONFIG（請修改）
-# =========================
-
-LINE_CHANNEL_ACCESS_TOKEN = "YOUR_LINE_TOKEN"
-
-GOOGLE_CREDENTIALS_FILE = "credentials.json"
-SHEET_NAME = "LINE_POS"
-
-# =========================
-# 🚀 INIT
+# APP INIT
 # =========================
 
 app = Flask(__name__)
+
+# =========================
+# ENV SAFE LOAD
+# =========================
+
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-
-processed_events = set()
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # =========================
-# 📊 GOOGLE SHEET INIT
+# GOOGLE SHEET AUTH (RENDER SAFE)
 # =========================
 
-def init_sheet():
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+
+creds = ServiceAccountCredentials.from_json_keyfile_dict(
+    creds_json,
+    scope
+)
+
+client = gspread.authorize(creds)
+
+product_sheet = client.open("pos").worksheet("Product")
+user_sheet = client.open("pos").worksheet("User")
+order_sheet = client.open("pos").worksheet("Order")
+log_sheet = client.open("pos").worksheet("Log")
+replay_sheet = client.open("pos").worksheet("Replay")
+
+# =========================
+# LOG SYSTEM
+# =========================
+
+def log_error(stage, message):
     try:
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive"
-        ]
+        log_sheet.append_row([
+            str(uuid.uuid4()),
+            datetime.utcnow().isoformat(),
+            stage,
+            "ERROR",
+            message,
+            ""
+        ])
+    except:
+        pass
 
-        creds = Credentials.from_service_account_file(
-            GOOGLE_CREDENTIALS_FILE,
-            scopes=scope
+# =========================
+# SAFE REPLY (CRITICAL FIX)
+# =========================
+
+def safe_reply(reply_token, text):
+
+    try:
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(text=text)
         )
 
-        client = gspread.authorize(creds)
-        sheet = client.open(SHEET_NAME).sheet1
-        return sheet
-
     except Exception as e:
-        print("SHEET INIT ERROR:", e)
-        return None
+        log_error("LINE_REPLY_FAILED", str(e))
 
-sheet = init_sheet()
+        # store replay event
+        try:
+            replay_sheet.append_row([
+                str(uuid.uuid4()),
+                datetime.utcnow().isoformat(),
+                json.dumps({"reply_token": reply_token, "text": text}),
+                "LINE_REPLY",
+                "PENDING",
+                0,
+                str(e),
+                datetime.utcnow().isoformat()
+            ])
+        except:
+            pass
 
 # =========================
-# 🧠 UNIT ENGINE
+# NLP / ORDER ENGINE
 # =========================
 
-NUM_MAP = {
-    "一":1,"壹":1,"1":1,
-    "兩":2,"二":2,"2":2,
-    "三":3,"3":3,
-    "四":4,"4":4,
-    "五":5,"5":5,
-    "六":6,"6":6,
-    "七":7,"7":7,
-    "八":8,"8":8,
-    "九":9,"9":9,
-    "十":10,"10":10
-}
+def normalize_product(text):
 
-UNIT_MAP = {
-    "杯":"cup",
-    "瓶":"bottle",
-    "份":"set"
-}
+    products = ["奶茶", "紅茶", "蛋糕", "雞腿"]
 
-NOISE = ["我要","幫我","請","來","買","給我"]
+    for p in products:
+        if p in text:
+            return p
 
-def clean(text):
-    if not text:
-        return ""
-    for w in NOISE:
-        text = text.replace(w,"")
-    return text.strip()
+    return "UNKNOWN"
 
-def parse_unit(text):
+def extract_item(text):
+
     qty = 1
-    unit = "item"
 
-    for k,v in NUM_MAP.items():
-        if k in text:
-            qty = v
+    if "兩" in text or "2" in text:
+        qty = 2
 
-    for k,v in UNIT_MAP.items():
-        if k in text:
-            unit = v
+    unit = "unit"
 
-    m = re.search(r"\d+", text)
-    if m:
-        qty = int(m.group())
-
-    return qty, unit
-
-def unit_engine(text):
-    text = clean(text)
-    qty, unit = parse_unit(text)
-
-    product = text
-    for k in list(NUM_MAP.keys()) + list(UNIT_MAP.keys()):
-        product = product.replace(k,"")
-
-    product = product.strip()
+    if "杯" in text:
+        unit = "cup"
+    elif "份" in text:
+        unit = "set"
 
     return {
-        "product": product if product else "unknown",
+        "product": normalize_product(text),
         "qty": qty,
         "unit": unit
     }
 
-# =========================
-# 🧠 LOG
-# =========================
+def parse_multi_item(text):
 
-def log_event(data):
-    print("LOG:", data)
+    text = text.replace("還有", "+").replace("加上", "+")
+    parts = text.split("+")
 
-# =========================
-# 🧠 SHEET WRITE（安全）
-# =========================
-
-def write_sheet(data):
-    try:
-        if sheet:
-            sheet.append_row(data)
-    except Exception as e:
-        print("SHEET ERROR:", e)
+    return [extract_item(p) for p in parts if p.strip()]
 
 # =========================
-# 🧠 DEDUP
+# ORDER PROCESSOR
 # =========================
 
-def is_duplicate(event_id):
-    if not event_id:
-        return False
-    if event_id in processed_events:
-        return True
-    processed_events.add(event_id)
-    return False
+def process_order(user_id, text):
+
+    items = parse_multi_item(text)
+
+    if not items:
+        return "⚠ 無法解析訂單"
+
+    order_id = str(uuid.uuid4())
+    total = 0
+
+    for item in items:
+
+        if item["product"] == "UNKNOWN":
+            return "❗ 未建立商品，請先建立商品"
+
+        price = 50
+        subtotal = price * item["qty"]
+        total += subtotal
+
+        try:
+            order_sheet.append_row([
+                order_id,
+                datetime.utcnow().isoformat(),
+                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                user_id,
+                "user",
+                "p001",
+                item["product"],
+                item["qty"],
+                price,
+                subtotal,
+                total,
+                "SUCCESS"
+            ])
+        except Exception as e:
+            log_error("SHEET_WRITE_FAILED", str(e))
+
+    return f"✔ 訂單成立：{order_id} 總額 {total}"
 
 # =========================
-# 🧠 CORE ENGINE
+# OPS COMMANDS
 # =========================
 
-def handle_text(text):
+def ops(text):
 
-    parsed = unit_engine(text)
+    if text == "/status":
+        return "🟢 SYSTEM OK"
 
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if text == "/help":
+        return "/status /help"
 
-    # 寫入 Sheet
-    write_sheet([
-        ts,
-        parsed["product"],
-        parsed["qty"],
-        parsed["unit"]
-    ])
-
-    return f"✔ 訂單成立：{parsed['product']} x{parsed['qty']} ({parsed['unit']})"
+    return None
 
 # =========================
-# 📡 LINE CALLBACK
+# WEBHOOK
 # =========================
 
 @app.route("/callback", methods=["POST"])
@@ -181,57 +206,41 @@ def callback():
     try:
         body = request.get_json()
 
-        print("RAW:", body)
+        for event in body["events"]:
 
-        if not body:
-            return "no body", 200
+            if event["type"] != "message":
+                continue
 
-        events = body.get("events", [])
-        if not events:
-            return "no events", 200
+            text = event["message"]["text"]
+            user_id = event["source"]["userId"]
+            reply_token = event["replyToken"]
 
-        event = events[0]
+            ops_result = ops(text)
 
-        event_id = event.get("webhookEventId") or event.get("replyToken")
+            if ops_result:
+                safe_reply(reply_token, ops_result)
+                return "OK"
 
-        if is_duplicate(event_id):
-            return "duplicate", 200
+            result = process_order(user_id, text)
 
-        message = event.get("message", {})
-        text = message.get("text", "")
-
-        reply_token = event.get("replyToken")
-
-        result = handle_text(text)
-
-        log_event({
-            "text": text,
-            "result": result
-        })
-
-        # LINE reply
-        line_bot_api.reply_message(
-            reply_token,
-            TextSendMessage(text=result)
-        )
-
-        return "OK", 200
+            safe_reply(reply_token, result)
 
     except Exception as e:
-        print("FATAL ERROR:", e)
-        return "error", 200
+        log_error("CALLBACK_FATAL", str(e))
+
+    return "OK"
 
 # =========================
-# ❤️ HEALTH CHECK
+# HEALTH CHECK
 # =========================
 
-@app.route("/", methods=["GET"])
-def home():
-    return "LINE POS RUNNING", 200
+@app.route("/")
+def health():
+    return "OK"
 
 # =========================
-# 🚀 RUN
+# RUN
 # =========================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run()
