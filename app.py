@@ -14,7 +14,6 @@ import openai
 # =========================
 # ENV
 # =========================
-
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -26,215 +25,192 @@ openai.api_key = OPENAI_API_KEY
 # =========================
 # APP INIT
 # =========================
-
 app = Flask(__name__)
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # =========================
-# GOOGLE SHEET INIT (SAFE)
+# GSHEET INIT
 # =========================
-
-sheet_client = None
 sheet_db = {}
 
 def init_gsheet():
-    global sheet_client, sheet_db
     try:
-        if not GOOGLE_CREDS_JSON:
-            print("[GSHEET INIT ERROR] GOOGLE_CREDS_JSON is empty")
-            return
-
         creds_dict = json.loads(GOOGLE_CREDS_JSON)
+        creds = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ]
+        )
+        client = gspread.authorize(creds)
+        db = client.open_by_key(GOOGLE_SHEET_ID)
 
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        sheet_client = gspread.authorize(creds)
-
-        db = sheet_client.open_by_key(GOOGLE_SHEET_ID)
-
-        sheet_db["User"] = db.worksheet("User")
-        sheet_db["Product"] = db.worksheet("Product")
-        sheet_db["Order"] = db.worksheet("Order")
-        sheet_db["Log"] = db.worksheet("Log")
+        # 🔒 完全對齊你 schema（小寫）
+        sheet_db["product"] = db.worksheet("product")
+        sheet_db["user"] = db.worksheet("user")
+        sheet_db["order"] = db.worksheet("order")
+        sheet_db["log"] = db.worksheet("log")
+        sheet_db["metrics"] = db.worksheet("metrics")
+        sheet_db["ai_cost"] = db.worksheet("ai_cost")
+        sheet_db["member"] = db.worksheet("member")
 
         print("[GSHEET INIT OK]")
 
     except Exception as e:
-        print(f"[GSHEET INIT ERROR] {e}")
-        sheet_client = None
+        print("[GSHEET INIT ERROR]", e)
 
 init_gsheet()
 
 # =========================
 # UTIL
 # =========================
-
 def now():
-    return datetime.datetime.now().isoformat()
+    return datetime.datetime.now()
 
-def safe_log(row):
+def iso():
+    return now().isoformat()
+
+def display_time():
+    return now().strftime("%Y-%m-%d %H:%M:%S")
+
+def gen_id(prefix):
+    return f"{prefix}_{int(now().timestamp())}"
+
+# =========================
+# LOG（完全對齊 schema）
+# =========================
+def write_log(stage, message, level="info", parsed="", missing="", ai_sum="", ai_sug="", status="ok"):
     try:
-        ws = sheet_db.get("Log")
-        if not ws:
-            return
-
+        ws = sheet_db["log"]
         ws.append_row([
-            now(),
-            "display",
+            gen_id("log"),
+            iso(),
+            display_time(),
             "system",
-            "info",
-            "v4",
-            str(row),
-            "",
-            "",
-            "",
-            "",
-            "ok"
+            level,
+            stage,
+            message,
+            parsed,
+            missing,
+            ai_sum,
+            ai_sug,
+            status
         ])
     except Exception as e:
         print("[LOG ERROR]", e)
 
 # =========================
-# HARD COMMAND LAYER (FIX UNKNOWN ISSUE)
+# PRODUCT CREATE
 # =========================
+def create_product(data):
+    ws = sheet_db["product"]
 
-def hard_router(text, user_id):
-    t = text.lower().strip()
+    row = [
+        gen_id("prod"),
+        data.get("product"),
+        data.get("price"),
+        data.get("category"),
+        data.get("stock", 0),
+        "active",
+        iso(),
+        iso()
+    ]
 
-    # TEST SHEET
-    if t in ["ping sheet", "test sheet", "sheet ping"]:
-        return test_sheet()
-
-    # CRUD SHORTCUTS (basic)
-    if t.startswith("add user"):
-        return "[USER ADD] parsed but not fully implemented safe mode"
-
-    if t.startswith("add product"):
-        return "[PRODUCT ADD] parsed but not fully implemented safe mode"
-
-    return None
-
-# =========================
-# SHEET TEST
-# =========================
-
-def test_sheet():
-    try:
-        if not sheet_db:
-            return "❌ SHEET NOT INIT"
-
-        tabs = list(sheet_db.keys())
-        return f"""[SHEET TEST OK]
-tabs: {tabs}
-status: connected
-write: ready"""
-    except Exception as e:
-        return f"[SHEET TEST FAIL] {e}"
+    ws.append_row(row)
+    return "✅ PRODUCT CREATED"
 
 # =========================
-# AI FALLBACK ENGINE
+# USER CREATE
 # =========================
+def create_user(data):
+    ws = sheet_db["user"]
 
+    row = [
+        gen_id("user"),
+        data.get("name"),
+        data.get("phone"),
+        data.get("address"),
+        iso(),
+        iso(),
+        "active"
+    ]
+
+    ws.append_row(row)
+    return "✅ USER CREATED"
+
+# =========================
+# ORDER CREATE（含計算）
+# =========================
+def create_order(data):
+    ws = sheet_db["order"]
+
+    qty = int(data.get("qty", 1))
+    price = int(data.get("unit_price", 0))
+
+    subtotal = qty * price
+
+    row = [
+        gen_id("order"),
+        iso(),
+        display_time(),
+        data.get("user_id"),
+        data.get("name"),
+        data.get("product_id"),
+        data.get("product"),
+        qty,
+        price,
+        subtotal,
+        subtotal,
+        "created"
+    ]
+
+    ws.append_row(row)
+    return f"🧾 ORDER CREATED: {subtotal}"
+
+# =========================
+# AI PARSER
+# =========================
 def ai_parse(text):
-    try:
-        if not OPENAI_API_KEY:
-            return "AI_DISABLED"
-
-        prompt = f"""
-You are a POS system parser.
+    prompt = f"""
 Return JSON only.
 
-TEXT:
 {text}
 
-Return format:
+Format:
 {{
-  "intent": "user|product|order|log|unknown",
-  "action": "create|update|delete|query",
-  "missing_fields": []
+ "intent": "product|user|order|unknown",
+ "data": {{}}
 }}
 """
-
+    try:
         res = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
-
-        return res.choices[0].message.content
-
+        return json.loads(res.choices[0].message.content)
     except Exception as e:
-        return f"AI_ERROR: {e}"
+        return {"intent": "unknown", "error": str(e)}
 
 # =========================
-# WEBHOOK
+# HARD COMMAND
 # =========================
+def hard_router(text):
+    t = text.lower()
 
-@app.route("/callback", methods=["POST"])
-def callback():
-    signature = request.headers.get("X-Line-Signature")
-    body = request.get_data(as_text=True)
+    if t == "ping sheet":
+        return str(list(sheet_db.keys()))
 
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-
-    return "OK"
+    return None
 
 # =========================
-# MESSAGE HANDLER
+# MAIN HANDLER
 # =========================
-
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = event.message.text
-    user_id = event.source.user_id
 
-    safe_log(f"IN: {text}")
-
-    # 1. HARD ROUTER FIRST (FIX unknown issue)
-    hard = hard_router(text, user_id)
-    if hard:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=hard)
-        )
-        safe_log(f"HARD: {hard}")
-        return
-
-    # 2. AI PARSE
-    ai_result = ai_parse(text)
-
-    # 3. FALLBACK RESPONSE
-    reply = f"""[AI MODE]
-input: {text}
-result: {ai_result}
-"""
-
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply)
-    )
-
-    safe_log(f"AI: {ai_result}")
-
-# =========================
-# ROOT
-# =========================
-
-@app.route("/")
-def home():
-    return "SBDPROJ SYSTEM BD v4 ONLINE"
-
-# =========================
-# MAIN
-# =========================
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    # HARD ROUTE
+    hard
